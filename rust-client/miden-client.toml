@@ -1,0 +1,14 @@
+default_account_id = "0x8a35215eabae3321"
+token_symbol_map_filepath = "token_symbol_map.toml"
+
+[rpc]
+timeout_ms = 10000
+
+[rpc.endpoint]
+protocol = "http"
+host = "18.203.155.106" # testnet
+# host = "localhost" # localhost
+port = 57291
+
+[store]
+database_filepath = "store.sqlite3"

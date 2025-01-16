@@ -1,0 +1,37 @@
+use.miden::contracts::wallets::basic
+use.miden::account
+use.miden::tx
+use.std::sys
+
+export.increment_count
+
+    # => []
+    push.0
+
+    # => [index]
+    exec.account::get_item
+
+    # => [count]
+    push.1 add
+
+    # => [count+1]
+    push.0
+
+    # [index, count+1]
+    exec.account::set_item
+
+    # => []
+    exec.account::get_nonce
+
+    # [nonce]
+    push.1 add
+
+    # => [nonce+1]
+    exec.account::incr_nonce
+
+    # debug statement with client
+    push.111 debug.stack drop
+
+    # => []
+    exec.sys::truncate_stack
+end

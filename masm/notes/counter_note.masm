@@ -1,0 +1,30 @@
+use.miden::account
+use.miden::note
+use.miden::kernels::tx::memory
+use.miden::contracts::wallets::basic->wallet
+use.std::sys
+
+begin
+    # drop note root
+    dropw
+
+    push.222
+    debug.stack
+    drop
+
+    push.0 exec.note::get_inputs drop drop
+    mem_load.1 mem_load.0 padw
+    # => [0,0,0,0, account_id_recipient, token_out_id]
+
+    debug.stack
+    push.2 exec.note::get_assets drop drop mem_loadw.2
+    # => [ASSET_IN, account_id_recipient, token_out_id]
+
+    push.101 debug.stack drop
+
+    call.{test_proc}
+
+    mem_loadw call.wallet::receive_asset
+
+    exec.sys::truncate_stack
+end
