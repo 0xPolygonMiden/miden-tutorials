@@ -2,4 +2,4 @@ target/
 *.sqlite3
 *.dat
 node/storage/*
-book/book/*
+docs/book/*

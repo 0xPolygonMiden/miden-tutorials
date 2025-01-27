@@ -4,7 +4,7 @@ The goal of this repository is to provide clear and practical examples for inter
 
 This repository is organized into several parts:
 
-1. **book** - contains the mdBook for the tutorials and guides.
+1. **docs** - contains the mdBook for the tutorials and guides.
 2. **masm** - contains the Miden assembly notes, accounts, and scripts used in the examples.
 3. **node** - contains the necessary config files for running the miden-node locally.
 4. **rust-client** - contains examples for interacting with the Miden Rollup using **Rust**. 
