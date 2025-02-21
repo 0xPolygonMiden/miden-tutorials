@@ -395,6 +395,32 @@ async fn main() -> Result<(), ClientError> {
 }
 ```
 
+The output of our program will look something like this:
+
+```
+Client initialized successfully.
+Latest block: 398181
+
+[STEP 1] Creating new accounts
+Alice's account ID: "0x76c0fec6b43e251000069a510cc7e9"
+Bob's account ID: "0x31407418e8cd8e100006f3243eb560"
+
+[STEP 2] Deploying a new fungible faucet.
+Faucet account ID: "0xd1623e23a1c46b20000679b4f4ad5b"
+
+[STEP 3] Mint tokens with Ephemeral P2ID
+one or more warnings were emitted
+
+[STEP 4] Create note
+digest: RpoDigest([14371582251229115050, 1386930022051078873, 17689831064175867466, 9632123050519021080])
+note hash: RpoDigest([14491046065979226876, 13018303687822666313, 12827596808478161901, 402082244652358068])
+View transaction on MidenScan: https://testnet.midenscan.com/tx/0x027ec685a4cabfce4cf5654818a50d77f7cb08f724bf11d869ac6812f3190129
+
+[STEP 5] Bob consumes the Ephemeral Hash Preimage Note with Correct Secret
+one or more warnings were emitted
+Consumed Note Tx on MidenScan: https://testnet.midenscan.com/tx/0x3f8d947bf072f862d4a31c61b2484ad0f16799f8d0f36916b163696c150fb059
+```
+
 ## Conclusion
 
 You have now seen how to create a custom note on Miden that requires a secret preimage to be consumed. We covered:
