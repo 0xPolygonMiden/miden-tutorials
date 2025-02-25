@@ -5,10 +5,10 @@ use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 use miden_client::{
     account::{
-        component::{BasicFungibleFaucet, BasicWallet, RpoFalcon512},
-        AccountBuilder, AccountStorageMode, AccountType,
+        component::{BasicWallet, RpoFalcon512},
+        AccountBuilder, AccountId, AccountStorageMode, AccountType,
     },
-    asset::{FungibleAsset, TokenSymbol},
+    asset::FungibleAsset,
     crypto::RpoRandomCoin,
     note::{
         Note, NoteAssets, NoteExecutionHint, NoteExecutionMode, NoteInputs, NoteMetadata,
@@ -92,35 +92,6 @@ async fn create_basic_account(
     Ok(account)
 }
 
-// Helper to deploy a fungible faucet account
-async fn deploy_faucet(
-    client: &mut Client<RpoRandomCoin>,
-    symbol: TokenSymbol,
-    decimals: u8,
-    max_supply: Felt,
-) -> Result<miden_client::account::Account, ClientError> {
-    let mut init_seed = [0u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-    let anchor_block = client.get_latest_epoch_block().await.unwrap();
-    let key_pair = SecretKey::with_rng(client.rng());
-    let builder = AccountBuilder::new(init_seed)
-        .anchor((&anchor_block).try_into().unwrap())
-        .account_type(AccountType::FungibleFaucet)
-        .storage_mode(AccountStorageMode::Public)
-        .with_component(RpoFalcon512::new(key_pair.public_key()))
-        .with_component(BasicFungibleFaucet::new(symbol, decimals, max_supply).unwrap());
-    let (account, seed) = builder.build().unwrap();
-    client
-        .add_account(
-            &account,
-            Some(seed),
-            &AuthSecretKey::RpoFalcon512(key_pair),
-            false,
-        )
-        .await?;
-    Ok(account)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
@@ -141,23 +112,13 @@ async fn main() -> Result<(), ClientError> {
     println!("Bob's account ID: {:?}", bob_account.id().to_hex());
 
     //------------------------------------------------------------
-    // STEP 2: Deploy a fungible faucet
+    // STEP 2: Mint and consume tokens for Alice with Ephemeral P2ID
     //------------------------------------------------------------
-    println!("\n[STEP 2] Deploying a new fungible faucet.");
-    let symbol = TokenSymbol::new("MID").unwrap();
-    let decimals = 8;
-    let max_supply = Felt::new(1_000_000);
-    let faucet_account = deploy_faucet(&mut client, symbol, decimals, max_supply).await?;
-    println!("Faucet account ID: {:?}", faucet_account.id().to_hex());
+    println!("\n[STEP 2] Mint tokens with Ephemeral P2ID");
 
-    client.sync_state().await?;
-
-    //------------------------------------------------------------
-    // STEP 3: Mint and consume tokens for Alice with Ephemeral P2ID
-    //------------------------------------------------------------
-    println!("\n[STEP 3] Mint tokens with Ephemeral P2ID");
+    let faucet_id = AccountId::from_hex("0xf42ab06ffd227c2000005b2767bc5e").unwrap();
     let amount: u64 = 100;
-    let fungible_asset_mint_amount = FungibleAsset::new(faucet_account.id(), amount).unwrap();
+    let fungible_asset_mint_amount = FungibleAsset::new(faucet_id, amount).unwrap();
 
     let transaction_request = TransactionRequestBuilder::mint_fungible_asset(
         fungible_asset_mint_amount.clone(),
@@ -169,7 +130,7 @@ async fn main() -> Result<(), ClientError> {
     .build();
 
     let tx_execution_result = client
-        .new_transaction(faucet_account.id(), transaction_request)
+        .new_transaction(faucet_id, transaction_request)
         .await?;
     client
         .submit_transaction(tx_execution_result.clone())
@@ -194,9 +155,9 @@ async fn main() -> Result<(), ClientError> {
     client.sync_state().await?;
 
     // -------------------------------------------------------------------------
-    // STEP 4: Hash Secret Number and Build Note
+    // STEP 3: Hash Secret Number and Build Note
     // -------------------------------------------------------------------------
-    println!("\n[STEP 4] Create note");
+    println!("\n[STEP 3] Create note");
 
     // Hashing secret number combination
     let mut note_secret_number = vec![Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)];
@@ -249,9 +210,9 @@ async fn main() -> Result<(), ClientError> {
     client.sync_state().await.unwrap();
 
     // -------------------------------------------------------------------------
-    // STEP 5: Consume Note
+    // STEP 4: Consume Note
     // -------------------------------------------------------------------------
-    println!("\n[STEP 5] Bob consumes the Ephemeral Hash Preimage Note with Correct Secret");
+    println!("\n[STEP 4] Bob consumes the Ephemeral Hash Preimage Note with Correct Secret");
     let secret = [Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)];
 
     let tx_note_consume_request = TransactionRequestBuilder::new()
