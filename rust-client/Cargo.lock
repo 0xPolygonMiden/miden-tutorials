@@ -2008,6 +2008,7 @@ dependencies = [
 name = "rust-client"
 version = "0.1.0"
 dependencies = [
+ "miden-assembly",
  "miden-client",
  "miden-crypto",
  "miden-lib",
