@@ -34,7 +34,7 @@ Then install the Miden compiler:
 cargo install --path midenc --locked
 ```
 
-and the cargo-miden toolchain:
+and the cargo-miden cargo extension:
 ```bash
 cargo install --path tools/cargo-miden --locked
 ```
