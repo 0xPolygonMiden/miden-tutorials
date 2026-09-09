@@ -1,3 +1,5 @@
+import { MIDEN_NETWORK } from '@/config';
+
 export function Header() {
   return (
     <header className="sticky top-0 z-10 border-b border-neutral-200 bg-neutral-100/85 px-6 py-4 backdrop-blur-md">
@@ -9,7 +11,7 @@ export function Header() {
           M
         </div>
         <h1 className="text-xl font-semibold tracking-tight text-neutral-900">Miden × Epoch</h1>
-        <span className="ui-chip">Testnet</span>
+        <span className="ui-chip">Miden {MIDEN_NETWORK}</span>
       </div>
     </header>
   );

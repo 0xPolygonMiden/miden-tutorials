@@ -30,7 +30,7 @@ describe('WithdrawConsume', () => {
     expect(
       screen.getByRole('heading', { name: /Note delivered to your Miden wallet/i }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Miden Wallet auto-consumes incoming notes/i)).toBeInTheDocument();
+    expect(screen.getByText(/sufficient native MIDEN to pay the consumption fee/i)).toBeInTheDocument();
     // Truncated note id (head of the hex string) is rendered.
     expect(screen.getByText(/0xnote1234/i)).toBeInTheDocument();
     // Midenscan link points at the right path.

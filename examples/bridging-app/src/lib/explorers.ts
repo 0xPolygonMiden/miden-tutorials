@@ -2,9 +2,13 @@
 // row using `chainId === MIDEN_CHAIN_ID` (999_999_999); everything else is an
 // EVM chain mapped here.
 
+import { MIDEN_NETWORK } from '../config';
+
 export const MIDEN_CHAIN_ID = 999_999_999;
 
-export const MIDENSCAN_BASE = 'https://testnet.midenscan.com';
+export const MIDENSCAN_BASE = (
+  import.meta.env.VITE_MIDENSCAN_URL || `https://${MIDEN_NETWORK}.midenscan.com`
+).replace(/\/+$/, '');
 
 const EVM_EXPLORERS: Record<number, string> = {
   1: 'https://etherscan.io',

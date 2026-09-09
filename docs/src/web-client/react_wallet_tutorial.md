@@ -34,6 +34,17 @@ By the end of this tutorial, you will have a working wallet that can:
 - Familiarity with React and TypeScript
 - `yarn`
 
+:::note v0.16 testnet and fees
+
+A new wallet needs native fee tokens before sending assets. Request and claim a
+funding note from the testnet faucet, as described in the
+[fee setup](./setup_guide.md#network-and-fee-setup). Claim the returned
+note ID and wait for confirmation before sending.
+
+Select testnet in both the client and any external wallet adapter.
+
+:::
+
 ---
 
 ## Step 1: Project Setup and MidenProvider
@@ -50,7 +61,7 @@ First, create a new Vite + React project and install the Miden React SDK.
 2. Install the Miden React SDK:
 
    ```bash
-   yarn add @miden-sdk/react
+   yarn add @miden-sdk/miden-sdk@0.16.0 @miden-sdk/react@0.16.0
    ```
 
 3. Configure the `MidenProvider` in your `main.tsx` file. The provider initializes the Miden client and makes it available to all child components:
@@ -78,8 +89,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 The `MidenProvider` accepts a `config` object with the following options:
 
-- `rpcUrl`: The RPC endpoint to connect to (`"testnet"` or a custom URL)
-- `prover`: The prover to use (`"testnet"` for delegated proving, or `"local"` for local proving)
+- `rpcUrl`: The RPC endpoint to connect to (`"testnet"`, `"devnet"`, or a custom URL)
+- `prover`: The prover to use (`"testnet"` for testnet delegated proving, or `"local"` for local proving)
 
 ---
 
@@ -146,6 +157,7 @@ The `useCreateWallet()` hook provides a function to create new wallet accounts.
 
 ```tsx
 import { useMiden, useAccounts, useCreateWallet } from '@miden-sdk/react/lazy';
+import { getWasmOrThrow } from '@miden-sdk/miden-sdk/lazy';
 
 export default function App() {
   const { isReady, error } = useMiden();
@@ -161,7 +173,12 @@ export default function App() {
     return (
       <div>
         <h1>Wallet</h1>
-        <button onClick={() => createWallet()} disabled={isCreating}>
+        <button
+          onClick={async () => createWallet({
+            authScheme: (await getWasmOrThrow()).AuthScheme.AuthRpoFalcon512,
+          })}
+          disabled={isCreating}
+        >
           {isCreating ? 'Creating...' : 'Create wallet'}
         </button>
       </div>
@@ -175,6 +192,10 @@ function Wallet({ accountId }: { accountId: string }) {
   return <div>Wallet: {accountId}</div>;
 }
 ```
+
+Pass the low-level Falcon enum explicitly with the pinned lazy React SDK. The
+high-level client's authentication enum is not interchangeable with the numeric
+enum expected by this hook.
 
 The `useCreateWallet()` hook returns:
 
@@ -465,7 +486,7 @@ import {
   useConsume,
   useSend,
 } from '@miden-sdk/react/lazy';
-import { NoteVisibility } from '@miden-sdk/miden-sdk/lazy';
+import { NoteVisibility, getWasmOrThrow } from '@miden-sdk/miden-sdk/lazy';
 
 const Panel = ({ title, children }: { title: string; children: ReactNode }) => (
   <div className="panel">
@@ -478,7 +499,9 @@ export default function App() {
   const { isReady, error } = useMiden();
   const { wallets, isLoading } = useAccounts();
   const { createWallet, isCreating } = useCreateWallet();
-  const handleCreate = () => createWallet();
+  const handleCreate = async () => createWallet({
+    authScheme: (await getWasmOrThrow()).AuthScheme.AuthRpoFalcon512,
+  });
   const createLabel = isCreating ? 'Creating...' : 'Create wallet';
 
   if (error) return <div className="center">Error: {error.message}</div>;
@@ -633,27 +656,42 @@ function Wallet({ accountId }: { accountId: string }) {
 
 ## Running the Example
 
-To run a full working example, navigate to the `packages/react-sdk/examples/wallet` directory in the [miden-client](https://github.com/0xMiden/miden-client/) repository:
+The complete upstream wallet example lives in
+[`packages/react-sdk/examples/wallet` in the web-sdk v0.16.0 release](https://github.com/0xMiden/web-sdk/tree/v0.16.0/packages/react-sdk/examples/wallet).
+Follow that example's README for its workspace setup and select testnet in its
+provider configuration.
+
+To exercise this repository's three React transaction examples on testnet:
 
 ```bash
-git clone https://github.com/0xMiden/miden-client.git
-cd miden-client/packages/react-sdk/examples/wallet
+cd web-client
 yarn install
 yarn dev
 ```
 
+Open `/react-tutorials` and select an example. These examples create and fund their
+own accounts; the wallet UI above starts with an empty wallet that needs funding.
+
 ### Resetting the MidenClientDB
 
-The Miden client stores account and note data in the browser's IndexedDB. To clear this data, paste the following into your browser console:
+The Miden client stores account and note data in the browser's IndexedDB.
+Upgrading from v0.15 automatically recreates the Miden store; export private
+notes and any other local data you need before upgrading. To manually reset only
+Miden databases on the current origin, close other tabs using the client and run:
 
 ```javascript
 (async () => {
   const dbs = await indexedDB.databases();
   for (const db of dbs) {
-    await indexedDB.deleteDatabase(db.name);
-    console.log(`Deleted database: ${db.name}`);
+    if (!db.name?.startsWith('MidenClientDB')) continue;
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(db.name);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error('Close other Miden tabs and retry'));
+    });
+    console.log(`Deleted Miden database: ${db.name}`);
   }
-  console.log('All databases deleted.');
 })();
 ```
 
@@ -701,13 +739,15 @@ This unified interface means your wallet UI code works the same regardless of wh
 
 [Para](https://para.space/) provides a modal-based authentication flow that allows users to sign in with their EVM wallets (MetaMask, WalletConnect, etc.).
 
-**Installation:**
+:::note Compatible Para release required
 
-```bash
-yarn add @miden-sdk/use-miden-para-react
-```
+`@miden-sdk/use-miden-para-react@0.15.1` requires v0.15 SDK packages.
+The pattern below needs an adapter release with v0.16-compatible peer dependencies;
+check the [package metadata](https://registry.npmjs.org/@miden-sdk/use-miden-para-react) before installing.
 
-**Usage:**
+:::
+
+**Integration pattern (requires a compatible adapter):**
 
 ```tsx
 import { ParaSignerProvider } from '@miden-sdk/use-miden-para-react';
@@ -753,13 +793,15 @@ function Wallet() {
 
 [Turnkey](https://turnkey.com/) provides programmatic key management, giving your application full control over the authentication flow.
 
-**Installation:**
+:::note Compatible Turnkey release required
 
-```bash
-yarn add @miden-sdk/miden-turnkey-react @turnkey/sdk-browser
-```
+`@miden-sdk/miden-turnkey-react@1.15.1` requires v0.15 SDK packages.
+The pattern below needs an adapter release with v0.16-compatible peer dependencies;
+check the [package metadata](https://registry.npmjs.org/@miden-sdk/miden-turnkey-react) before installing.
 
-**Usage:**
+:::
+
+**Integration pattern (requires a compatible adapter):**
 
 ```tsx
 import { TurnkeySignerProvider } from '@miden-sdk/miden-turnkey-react';
@@ -809,18 +851,19 @@ The `useTurnkeySigner()` hook is available for advanced use cases where you need
 **Installation:**
 
 ```bash
-yarn add @miden-sdk/miden-wallet-adapter-react
+yarn add @miden-sdk/miden-wallet-adapter-react@0.16.0 @miden-sdk/miden-wallet-adapter-base@0.16.0
 ```
 
 **Usage:**
 
 ```tsx
 import { MidenFiSignerProvider } from '@miden-sdk/miden-wallet-adapter-react';
+import { WalletAdapterNetwork } from '@miden-sdk/miden-wallet-adapter-base';
 import { MidenProvider, useSigner } from '@miden-sdk/react/lazy';
 
 function App() {
   return (
-    <MidenFiSignerProvider network="testnet">
+    <MidenFiSignerProvider network={WalletAdapterNetwork.Testnet}>
       <MidenProvider config={{ rpcUrl: 'testnet' }}>
         <Wallet />
       </MidenProvider>
@@ -845,11 +888,14 @@ function Wallet() {
 
 **MidenFiSignerProvider Props:**
 
-| Prop                    | Type                      | Description                            |
-| ----------------------- | ------------------------- | -------------------------------------- |
-| `network`               | `"testnet" \| "localnet"` | Target network                         |
-| `privateDataPermission` | `boolean`                 | Whether to request private data access |
-| `allowedPrivateData`    | `string[]`                | List of allowed private data types     |
+| Prop                    | Type                    | Description                              |
+| ----------------------- | ----------------------- | ---------------------------------------- |
+| `network`               | `WalletAdapterNetwork`  | `Testnet`, `Devnet`, or `Localnet`       |
+| `privateDataPermission` | `PrivateDataPermission` | Permission level for private data access |
+| `allowedPrivateData`    | `AllowedPrivateData`    | Private-data categories the app requests |
+
+Import the enums from `@miden-sdk/miden-wallet-adapter-base`. Do not pass raw
+network strings, booleans, or string arrays in place of these enum values.
 
 ---
 
@@ -934,5 +980,5 @@ The `SignerContextValue` interface requires:
 Now that you've built a React wallet, explore these related topics:
 
 - [Creating Multiple Notes in a Single Transaction](./creating_multiple_notes_tutorial.md) - Learn about batch operations
-- [Miden React SDK Reference](https://github.com/0xMiden/miden-client/tree/main/packages/react-sdk) - Full API documentation
+- [Miden React SDK Reference](https://github.com/0xMiden/web-sdk/tree/v0.16.0/packages/react-sdk) - Full API documentation
 - [Miden Documentation](https://docs.miden.io/) - Core Miden concepts

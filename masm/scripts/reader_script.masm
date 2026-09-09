@@ -1,8 +1,18 @@
 use external_contract::count_reader_contract
 use miden::core::sys
 
-begin
-    padw padw padw padw
+#! Copies a public counter through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
     # => [pad(16)]
 
     push.{get_count_proc_hash}
@@ -15,8 +25,8 @@ begin
     # => [account_id_suffix, account_id_prefix, GET_COUNT_HASH, pad(16)]
 
     call.count_reader_contract::copy_count
-    # => []
+    # => [pad(22)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end

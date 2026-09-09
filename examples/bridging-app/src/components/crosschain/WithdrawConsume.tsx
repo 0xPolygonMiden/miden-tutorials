@@ -12,9 +12,9 @@ interface Props {
  * Post-withdraw informational panel.
  *
  * The Epoch allocator delivers bridged funds as a P2ID note addressed to the
- * user's Miden wallet account. The Miden Wallet consumes that note when it
- * detects it, so this panel reports delivery and links to Midenscan instead of
- * initiating a second transaction from the page.
+ * user's Miden wallet account. Its consumption is handled by the wallet and
+ * requires native fees, so this panel reports delivery and links to Midenscan
+ * instead of initiating a second transaction from the page.
  */
 export function WithdrawConsume({ noteId }: Props) {
   if (!noteId) return null;
@@ -26,10 +26,10 @@ export function WithdrawConsume({ noteId }: Props) {
         <p className="mt-1 text-sm leading-relaxed text-neutral-600">
           The allocator delivered the bridged funds as a <strong>P2ID note</strong> to your Miden
           wallet account. In Miden's actor model the note must be{' '}
-          <em>consumed</em> before it becomes spendable balance — but the Miden Wallet auto-consumes
-          incoming notes on detection, so no action is required here. Open your wallet to confirm
-          the new balance; the bridged USDC is ready to use as the source for another
-          Miden&nbsp;→&nbsp;EVM bridge or any other Miden transaction.
+          <em>consumed</em> before it becomes spendable balance. Wallet auto-consumption depends
+          on your wallet settings and sufficient native MIDEN to pay the consumption fee.
+          A USDC note does not itself fund that native fee. Open your wallet to confirm
+          consumption and the new balance before spending the bridged funds.
         </p>
       </div>
 
@@ -54,7 +54,7 @@ export function WithdrawConsume({ noteId }: Props) {
 
       <p className="text-[11px] text-neutral-500 italic">
         If your wallet does not show the credited balance, the note may still be propagating
-        through testnet — refresh the wallet after a few seconds. Some wallet builds let you
+        through the network — refresh the wallet after a few seconds. Some wallet builds let you
         disable auto-consume; in that case, consume the note manually from the wallet's Notes tab.
       </p>
     </div>

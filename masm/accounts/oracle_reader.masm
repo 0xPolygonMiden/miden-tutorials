@@ -1,38 +1,42 @@
-# The oracle account ID, procedure hash, and pair ID below reference
-# Pragma's Miden v0.15 testnet deployment (https://github.com/astraly-labs/pragma-miden).
-# Pragma's addresses change between testnet iterations (their README is the
-# source of truth), so if the oracle is redeployed these values must be updated:
-# the oracle account id, the `get_median` procedure root, and (if a different
-# feed) the faucet pair id.
+# the Rust runner replaces these placeholders with values from a compatible
+# pragma deployment before compiling this component.
 
 use miden::protocol::tx
 
-# Fetches the current price from the `get_median`
-# procedure from the Pragma oracle
-# => []
-pub proc get_price
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Queries the configured Pragma oracle's median price through a foreign procedure.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Panics if:
+#! - the configured oracle procedure or its required foreign state is unavailable.
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_price()
     # `execute_foreign_procedure` requires exactly 16 foreign procedure inputs.
     # `get_median` only reads the first four, so the rest are zero padding.
     padw padw padw
-    # => [PAD(12)]
+    # => [pad(28)]
 
-    # BTC/USD pair: faucet id prefix `1`, suffix `0`, amount `0`
-    push.0.0.0.1
-    # => [pair_prefix, pair_suffix, amount, 0, PAD(12)]
+    # requested pair: faucet ID prefix/suffix, amount `0`.
+    push.0.0.{pair_suffix}.{pair_prefix}
+    # => [pair_prefix, pair_suffix, amount, 0, pad(28)]
 
-    # This is the procedure root of the `get_median` procedure
-    push.0xaa3a12d4e9de2dad37c50dba93809b9c17226d512e642d3d620c77088a85da71
-    # => [GET_MEDIAN_HASH, FOREIGN_INPUTS(16)]
+    # this is the procedure root of the `get_median` procedure.
+    push.{get_median_proc_root}
+    # => [GET_MEDIAN_HASH, foreign_procedure_inputs(16), pad(16)]
 
-    # The Pragma oracle account id: prefix then suffix, leaving suffix on top
-    push.8850886096234572817.9093477099503364096
-    # => [oracle_id_suffix, oracle_id_prefix, GET_MEDIAN_HASH, FOREIGN_INPUTS(16)]
+    # the Pragma oracle account id: prefix then suffix, leaving suffix on top.
+    push.{oracle_id_prefix}.{oracle_id_suffix}
+    # => [oracle_id_suffix, oracle_id_prefix, GET_MEDIAN_HASH, foreign_procedure_inputs(16), pad(16)]
 
     exec.tx::execute_foreign_procedure
-    # => [is_tracked, median_price, amount, PAD(13)]
-
-    debug.stack
-    # => [is_tracked, median_price, amount, PAD(13)]
+    # => [is_tracked, median_price, amount, pad(29)]
 
     dropw dropw dropw dropw
+    # => [pad(16)]
 end

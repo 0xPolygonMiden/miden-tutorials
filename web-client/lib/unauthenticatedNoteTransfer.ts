@@ -1,19 +1,23 @@
 /**
- * Demonstrates unauthenticated note transfer chain against Miden testnet
+ * Demonstrates unauthenticated note transfer chain against the configured Miden network
  * Creates a chain of P2ID (Pay to ID) notes: Alice → wallet 1 → wallet 2 → wallet 3 → wallet 4
  *
  * @throws {Error} If the function cannot be executed in a browser environment
  */
-import { MidenClient, NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import {
+  consumeAllFeeAware,
+  createTutorialClient,
+  fundAccountForFees,
+  tutorialExplorerUrl,
+} from './feeSupport';
 
 export async function unauthenticatedNoteTransfer(): Promise<void> {
   // Ensure this runs only in a browser context
   if (typeof window === 'undefined') return console.warn('Run in browser');
 
-  await MidenClient.ready();
-
-  const client = await MidenClient.create({
-    rpcUrl: 'https://rpc.testnet.miden.io',
+  const client = await createTutorialClient({
+    proverUrl: 'local',
   });
 
   console.log('Latest block:', (await client.sync()).blockNum());
@@ -36,7 +40,6 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
     console.log('wallet ', i.toString(), wallet.id().toString());
   }
 
-  // ── Creating new faucet ──────────────────────────────────────────────────────
   const faucet = await client.accounts.create({
     type: 0, // 0 = FungibleFaucet
     symbol: 'MID',
@@ -45,22 +48,23 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
     storage: StorageMode.Public,
   });
   console.log('Faucet ID:', faucet.id().toString());
+  await fundAccountForFees(client, alice);
+  await fundAccountForFees(client, faucet);
 
-  // ── mint 10 000 MID to Alice ──────────────────────────────────────────────────────
+  await client.sync();
   const { txId: mintTxId } = await client.transactions.mint({
     account: faucet,
     to: alice,
     amount: BigInt(10_000),
     type: NoteVisibility.Public,
   });
-
   console.log('Waiting for settlement');
-  await client.transactions.waitFor(mintTxId);
+  await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
+  await consumeAllFeeAware(client, alice);
 
-  // ── Consume the freshly minted note ──────────────────────────────────────────────
-  await client.transactions.consumeAll({
-    account: alice,
-  });
+  for (const wallet of wallets) {
+    await fundAccountForFees(client, wallet);
+  }
 
   // ── Create unauthenticated note transfer chain ─────────────────────────────────────────────
   // Alice → wallet 1 → wallet 2 → wallet 3 → wallet 4
@@ -73,24 +77,36 @@ export async function unauthenticatedNoteTransfer(): Promise<void> {
     console.log('Sender:', sender.id().toString());
     console.log('Receiver:', receiver.id().toString());
 
-    const { note } = await client.transactions.send({
+    await client.sync();
+    const { note, txId: sendTxId } = await client.transactions.send({
       account: sender,
       to: receiver,
       token: faucet,
       amount: BigInt(50),
       type: NoteVisibility.Public,
       returnNote: true,
+      waitForConfirmation: false,
     });
 
+    // Pass the full note before waiting for the sender's transaction.
+    await client.sync();
     const { txId: consumeTxId } = await client.transactions.consume({
       account: receiver,
       notes: [note],
+      waitForConfirmation: true,
+      timeout: 120_000,
     });
+    await client.transactions.waitFor(sendTxId, { timeout: 120_000 });
+    console.log(`Transaction committed: ${consumeTxId.toHex()}`);
 
     console.log(
-      `Consumed Note Tx on MidenScan: https://testnet.midenscan.com/tx/${consumeTxId.toHex()}`,
+      `Consumed Note Tx on MidenScan: ${tutorialExplorerUrl()}/tx/${consumeTxId.toHex()}`,
     );
   }
 
+  const lastWallet = await client.accounts.get(wallets[wallets.length - 1]);
+  const balance = lastWallet?.vault().getBalance(faucet.id());
+  if (balance !== BigInt(50))
+    throw new Error(`Expected last wallet to hold 50 MID, got ${balance}`);
   console.log('Asset transfer chain completed ✅');
 }

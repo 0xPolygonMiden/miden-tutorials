@@ -3,8 +3,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SelectContent, SelectItem, SelectRoot, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useMidenFiWallet } from '@miden-sdk/miden-wallet-adapter-react';
-import { SendTransaction } from '@miden-sdk/miden-wallet-adapter-base';
-import { useSyncState } from '@miden-sdk/react';
+import { Transaction } from '@miden-sdk/miden-wallet-adapter-base';
+import { AccountId, NoteArray } from '@miden-sdk/miden-sdk';
+import { useMiden, useSyncState } from '@miden-sdk/react';
 import { useState } from 'react';
 import { toast } from 'sonner';
 import type { CrossChainIntentParams } from '../../types/miden';
@@ -16,6 +17,8 @@ import { DEFAULT_SEPOLIA_CHAIN_ID_STR } from '../../constants/chains';
 import { useAccount } from 'wagmi';
 import { useIntentTransactionStatus } from '../../hooks/useIntentTransactionStatus';
 import { selectDestinationSettlement } from '../../lib/intentSettlement';
+import { createEpochCollateralNote } from '../../services/epoch-collateral';
+import { midenscanNoteUrl } from '../../lib/explorers';
 
 const SEPOLIA_TOKENS = [
   { symbol: 'USDC', address: '0x2BB4FfD7E2c6D432b697554Efd77fA13bdbefd69', decimals: 18 },
@@ -41,7 +44,7 @@ interface Props {
   }>;
   isLoadingMidenAssets: boolean;
   onFetchQuote: (params: CrossChainIntentParams) => Promise<void>;
-  onConfirmIntent: (createMidenP2IDNote: SolveIntentParams['createMidenP2IDNote']) => Promise<unknown>;
+  onConfirmIntent: (createMidenP2IDENote: SolveIntentParams['createMidenP2IDENote']) => Promise<unknown>;
   onClearQuote: () => void;
   pendingQuote: CrossChainQuote | null;
   isFetchingQuote: boolean;
@@ -65,7 +68,8 @@ export function IntentForm({
   intentNonce,
   intentUserAddress,
 }: Props) {
-  const { requestSend, waitForTransaction } = useMidenFiWallet();
+  const { requestTransaction, waitForTransaction } = useMidenFiWallet();
+  const { client, runExclusive } = useMiden();
   const { syncHeight } = useSyncState();
 
   const [selectedAssetId, setSelectedAssetId] = useState('');
@@ -103,10 +107,8 @@ export function IntentForm({
   const evmTransactionHash = evmCompletedStatus?.transactionHash;
   const evmTxChainId = evmCompletedStatus?.chainId ?? destinationChainIdNum;
 
-  const midenScanBase =
-    (import.meta as any).env?.VITE_MIDENSCAN_URL || 'https://testnet.midenscan.com';
   const midenNoteUrl = localMidenNoteId
-    ? `${midenScanBase}/note/${localMidenNoteId}`
+    ? midenscanNoteUrl(localMidenNoteId)
     : undefined;
 
   const explorerTxUrl = (() => {
@@ -197,41 +199,44 @@ export function IntentForm({
   const handleConfirm = () => {
     if (!pendingQuote) return;
 
-    const createMidenP2IDNote: SolveIntentParams['createMidenP2IDNote'] = async (
+    const createMidenP2IDENote: SolveIntentParams['createMidenP2IDENote'] = async (
       faucetIdParam,
       amountParam,
       allocatorId,
+      recallBlocks,
+      bindingAttachmentFelts,
     ) => {
       setConfirmStatus('Resource lock required — creating P2IDE note on Miden…');
       try {
         if (!midenAccountId) {
           throw new Error('Missing Miden account id');
         }
-        if (!requestSend) {
-          throw new Error('Miden wallet adapter is not connected');
+        if (!requestTransaction || !waitForTransaction || !client) {
+          throw new Error('Connect a Miden wallet that supports custom transactions and confirmation');
         }
 
-        const normalizedAmount = BigInt(amountParam);
-        if (normalizedAmount > BigInt(Number.MAX_SAFE_INTEGER)) {
-          throw new Error('Amount too large for wallet adapter send');
-        }
-
-        const payload = new SendTransaction(
-          midenAccountId,
-          allocatorId,
-          faucetIdParam,
-          'public',
-          Number(normalizedAmount),
+        const { request, expectedNoteId } = await runExclusive(async () => {
+          const head = await client.syncState();
+          const note = createEpochCollateralNote({
+            sender: midenAccountId, allocator: allocatorId, faucet: faucetIdParam,
+            amount: BigInt(amountParam), currentBlock: head.blockNum(),
+            recallBlocks, bindingAttachmentFelts,
+          });
+          const builder = await client.feeAwareTransactionRequestBuilder(AccountId.fromHex(midenAccountId));
+          return {
+            expectedNoteId: note.id().toString(),
+            request: builder.withOwnOutputNotes(new NoteArray([note])).build(),
+          };
+        });
+        const txId = await requestTransaction(
+          Transaction.createCustomTransaction(midenAccountId, allocatorId, request),
         );
-        const txId = await requestSend(payload);
 
-        // Prefer adapter waitForTransaction to get the output note id.
-        if (!waitForTransaction) {
-          throw new Error('Miden wallet adapter is missing waitForTransaction');
-        }
+        // Wait for the wallet to confirm the collateral before submitting it to Epoch.
         const finalized = await waitForTransaction(txId, 120_000);
-        const first = finalized.outputNotes?.[0];
-        const noteId = first ? first.id().toString() : '';
+        // A fee-paying transaction also creates a TX_FEE note. Match our exact
+        // collateral note instead of assuming outputNotes[0] is the payment.
+        const noteId = finalized.outputNotes?.find(note => note.id().toString() === expectedNoteId)?.id().toString();
         if (!noteId) {
           throw new Error(`Could not read output note id for tx ${txId}`);
         }
@@ -245,7 +250,7 @@ export function IntentForm({
     void toast.promise(
       (async () => {
         setConfirmStatus('Submitting intent…');
-        const result = await onConfirmIntent(createMidenP2IDNote);
+        const result = await onConfirmIntent(createMidenP2IDENote);
         if (result && typeof result === 'object' && 'error' in result && (result as { error?: string }).error) {
           throw new Error((result as { error: string }).error);
         }

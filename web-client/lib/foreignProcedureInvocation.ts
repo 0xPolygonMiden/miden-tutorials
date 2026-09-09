@@ -1,7 +1,16 @@
 // lib/foreignProcedureInvocation.ts
 import counterContractCode from './masm/counter_contract.masm';
 import countReaderCode from './masm/count_reader.masm';
-import { AuthSecretKey, StorageMode, StorageSlot, StorageResult, MidenClient } from '@miden-sdk/miden-sdk/lazy';
+import {
+  AuthSecretKey,
+  StorageSlot,
+  StorageResult,
+} from '@miden-sdk/miden-sdk/lazy';
+import {
+  createFundableContractAccount,
+  createTutorialClient,
+  fundAccountForFees,
+} from './feeSupport';
 
 export async function foreignProcedureInvocation(): Promise<void> {
   if (typeof window === 'undefined') {
@@ -9,10 +18,7 @@ export async function foreignProcedureInvocation(): Promise<void> {
     return;
   }
 
-  await MidenClient.ready();
-
-  const nodeEndpoint = 'https://rpc.testnet.miden.io';
-  const client = await MidenClient.create({ rpcUrl: nodeEndpoint });
+  const client = await createTutorialClient({ proverUrl: 'local' });
   console.log('Current block number: ', (await client.sync()).blockNum());
 
   const counterSlotName = 'miden::tutorials::counter';
@@ -32,30 +38,54 @@ export async function foreignProcedureInvocation(): Promise<void> {
   crypto.getRandomValues(counterSeed);
   const counterAuth = AuthSecretKey.rpoFalconWithRNG(counterSeed);
 
-  const counterAccount = await client.accounts.create({
-    storage: StorageMode.Public,
-    seed: counterSeed,
-    auth: counterAuth,
-    components: [counterComponent],
-  });
+  const counterAccount = await createFundableContractAccount(
+    client,
+    counterSeed,
+    counterAuth,
+    [counterComponent],
+  );
+
+  await fundAccountForFees(client, counterAccount);
 
   // Deploy the counter to the node by executing a transaction on it
   const deployScript = await client.compile.txScript({
     code: `
-      use external_contract::counter_contract
-      begin
-        call.counter_contract::increment_count
-      end
-    `,
-    libraries: [{ namespace: 'external_contract::counter_contract', code: counterContractCode }],
+use external_contract::counter_contract
+
+#! Increments the counter.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
+    call.counter_contract::increment_count
+    # => [pad(16)]
+end
+`,
+    libraries: [
+      {
+        namespace: 'external_contract::counter_contract',
+        code: counterContractCode,
+      },
+    ],
   });
 
   // Wait for the deploy transaction to be committed to a block
   // before using it as a foreign account in FPI
+  await client.sync();
   await client.transactions.execute({
     account: counterAccount,
     script: deployScript,
     waitForConfirmation: true,
+    timeout: 120_000,
   });
   console.log('Counter contract ID:', counterAccount.id().toString());
 
@@ -73,12 +103,14 @@ export async function foreignProcedureInvocation(): Promise<void> {
   crypto.getRandomValues(readerSeed);
   const readerAuth = AuthSecretKey.rpoFalconWithRNG(readerSeed);
 
-  let countReaderAccount = await client.accounts.create({
-    storage: StorageMode.Public,
-    seed: readerSeed,
-    auth: readerAuth,
-    components: [countReaderComponent],
-  });
+  const countReaderAccount = await createFundableContractAccount(
+    client,
+    readerSeed,
+    readerAuth,
+    [countReaderComponent],
+  );
+
+  await fundAccountForFees(client, countReaderAccount);
 
   console.log('Count reader contract ID:', countReaderAccount.id().toString());
 
@@ -92,11 +124,21 @@ export async function foreignProcedureInvocation(): Promise<void> {
   const getCountProcHash = counterComponent.getProcedureHash('get_count');
 
   const fpiScriptCode = `
-    use external_contract::count_reader_contract
-    use miden::core::sys
+use external_contract::count_reader_contract
+use miden::core::sys
 
-    begin
-    padw padw padw padw
+#! Copies a public counter through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
     # => [pad(16)]
 
     push.${getCountProcHash}
@@ -109,24 +151,32 @@ export async function foreignProcedureInvocation(): Promise<void> {
     # => [account_id_suffix, account_id_prefix, GET_COUNT_HASH, pad(16)]
 
     call.count_reader_contract::copy_count
-    # => []
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
-
-    end
+    # => [pad(16)]
+end
 `;
 
   const script = await client.compile.txScript({
     code: fpiScriptCode,
-    libraries: [{ namespace: 'external_contract::count_reader_contract', code: countReaderCode }],
+    libraries: [
+      {
+        namespace: 'external_contract::count_reader_contract',
+        code: countReaderCode,
+      },
+    ],
   });
 
-  await client.transactions.execute({
+  await client.sync();
+  const { txId } = await client.transactions.execute({
     account: countReaderAccount,
     script,
     foreignAccounts: [counterAccount],
+    waitForConfirmation: true,
+    timeout: 120_000,
   });
+  console.log(`Transaction committed: ${txId.toHex()}`);
 
   const updatedCountReader = await client.accounts.get(countReaderAccount);
   // `getItem()` is typed to return a low-level `Word`, but at runtime the SDK
@@ -138,7 +188,11 @@ export async function foreignProcedureInvocation(): Promise<void> {
 
   if (countReaderStorage) {
     const countValue = Number(countReaderStorage.toBigInt());
+    if (countValue !== 1)
+      throw new Error(`Expected copied counter 1, got ${countValue}`);
     console.log('Count copied via Foreign Procedure Invocation:', countValue);
+  } else {
+    throw new Error('Count reader storage was not available after commitment');
   }
 
   console.log('\nForeign Procedure Invocation Transaction completed!');

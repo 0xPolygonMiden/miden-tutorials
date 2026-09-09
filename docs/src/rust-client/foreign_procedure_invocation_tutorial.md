@@ -7,6 +7,8 @@ sidebar_position: 7
 
 _Using foreign procedure invocation to craft read-only cross-contract calls in the Miden VM_
 
+For toolchain requirements and shared fee helpers, see the [Rust client setup](./index.md#running-the-v016-examples).
+
 ## Overview
 
 In previous tutorials we deployed a public counter contract and incremented the count from a different client instance.
@@ -32,43 +34,91 @@ The diagram above depicts the "count copy" smart contract using foreign procedur
 
 ## Prerequisites
 
-This tutorial assumes you have a basic understanding of Miden assembly and completed the previous tutorial on deploying the counter contract. We will be working within the same `miden-counter-contract` repository that we created in the [Interacting with Public Smart Contracts](./public_account_interaction_tutorial.md) tutorial.
+This tutorial assumes you have a basic understanding of Miden assembly and a counter deployed using the [counter contract tutorial](./counter_contract_tutorial.md). Keep its printed `mtst1...` account ID. The reader runs in a separate Cargo project and reads that counter's public state.
 
 ## Step 1: Set up your repository
 
-We will be using the same repository used in the "Interacting with Public Smart Contracts" tutorial. To set up your repository for this tutorial, first follow up until step two [here](./public_account_interaction_tutorial.md).
+From the parent directory of your `tutorials` clone, create a sibling Cargo project:
+
+```bash
+cargo new miden-fpi
+cd miden-fpi
+rustup override set 1.98.1
+cp ../tutorials/rust-client/Cargo.lock Cargo.lock
+```
+
+Add these dependencies and the development profile to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rust-client = { path = "../tutorials/rust-client" }
+miden-client = { version = "=0.16.0", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { version = "=0.16.0", package = "miden-client-sqlite-store" }
+miden-protocol = { version = "=0.16.0" }
+rand = { version = "0.10" }
+tokio = { version = "1.48", features = ["rt-multi-thread", "net", "macros", "fs"] }
+
+[profile.dev]
+opt-level = 2
+```
 
 ## Step 2: Set up the "count reader" contract
 
-Inside of the `masm/accounts/` directory, create the `count_reader.masm` file. This is the smart contract that will read the "count" value from the counter contract.
+The reader contract in `masm/accounts/count_reader.masm` reads the counter’s value through FPI.
 
 `masm/accounts/count_reader.masm`:
 
 ```masm
-use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::tx
-use miden::core::word
 use miden::core::sys
+use {AccountId, AccountProcedureRoot} from miden::protocol::types
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNT_READER_SLOT = word("miden::tutorials::count_reader")
 
-# => [account_id_suffix, account_id_prefix, PROC_HASH(4), foreign_procedure_inputs(16)]
-pub proc copy_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Copies the count returned by the foreign counter into this account's storage.
+#!
+#! Inputs:  [foreign_account_id_{suffix,prefix}, FOREIGN_PROC_ROOT, pad(10)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - foreign_account_id_{suffix,prefix} identifies the public counter account.
+#! - FOREIGN_PROC_ROOT is the root of its get_count procedure.
+#!
+#! Invocation: call
+@account_procedure
+@locals(6)
+pub proc copy_count(foreign_account_id: AccountId, foreign_proc_root: AccountProcedureRoot)
+    # save the foreign target while preparing its sixteen zero inputs
+    loc_store.4 loc_store.5 loc_storew_le.0 dropw
+    # => [pad(16)]
+
+    padw padw padw padw
+    # => [foreign_procedure_inputs(16), pad(16)]
+
+    padw loc_loadw_le.0 loc_load.5 loc_load.4
+    # => [foreign_account_id_suffix, foreign_account_id_prefix, FOREIGN_PROC_ROOT, foreign_procedure_inputs(16), pad(16)]
+
     exec.tx::execute_foreign_procedure
-    # => [count, pad(12)]
+    # => [[count, 0, 0, 0], pad(28)]
 
     push.COUNT_READER_SLOT[0..2]
-    # [slot_id_prefix, slot_id_suffix, count, pad(12)]
+    # => [slot_id_suffix, slot_id_prefix, [count, 0, 0, 0], pad(28)]
 
     exec.native_account::set_item
-    # => [OLD_VALUE, pad(12)]
+    # => [OLD_VALUE, pad(28)]
 
-    dropw dropw dropw dropw
-    # => []
+    dropw
+    # => [pad(28)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
@@ -84,22 +134,33 @@ This is what the stack state should look like before we call `tx::execute_foreig
 
 `execute_foreign_procedure` always requires exactly 16 `foreign_procedure_inputs` on the stack
 below the procedure hash and account ID. Since `get_count` takes no arguments, we pass 16 zero
-words (`padw padw padw padw`) as the inputs. After the call, the procedure returns 16 output
-elements; the count word sits at the top and we clean up the rest with `dropw dropw dropw dropw`.
+felts (`padw padw padw padw`, four words) as the inputs. The reader prepares these
+inputs internally after saving the account ID and procedure root in local memory. The
+caller therefore passes only those six identifying felts. After the foreign call,
+the count is the first of 16 output elements; the reader stores its word, discards
+the previous storage value, and truncates the remaining padding.
 
 After calling the `get_count` procedure in the counter contract, we save the count into the
 `miden::tutorials::count_reader` storage slot.
 
-**Note**: _The bracket symbols used in the count copy contract are not valid MASM syntax. These are simply placeholder elements that we will replace with the actual values before compilation._
-
-Inside the `masm/scripts/` directory, create the `reader_script.masm` file:
+The transaction script is defined in `masm/scripts/reader_script.masm`:
 
 ```masm
 use external_contract::count_reader_contract
 use miden::core::sys
 
-begin
-    padw padw padw padw
+#! Copies a public counter through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
     # => [pad(16)]
 
     push.{get_count_proc_hash}
@@ -112,43 +173,49 @@ begin
     # => [account_id_suffix, account_id_prefix, GET_COUNT_HASH, pad(16)]
 
     call.count_reader_contract::copy_count
-    # => []
+    # => [pad(22)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
-**Note**: _`push.{get_count_proc_hash}` is not valid MASM, we will format the string with the value get_count_proc_hash before passing this script code to the assembler._
+The braces mark template values, not valid MASM operands. The Rust code replaces the procedure root and both account ID elements before assembling the script.
 
-### Step 3: Set up your `src/main.rs` file:
+## Step 3: Set up your `src/main.rs` file
 
 ```rust no_run
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::time::sleep;
 
 use miden_client::{
+    ClientError, Word,
     account::{
-        component::AccountComponentMetadata, AccountBuilder, AccountComponent, AccountId,
-        AccountType, StorageSlot, StorageSlotName,
+        AccountBuilder, AccountComponent, AccountId, AccountType, StorageSlot, StorageSlotName,
+        component::{AccountComponentMetadata, BasicWallet},
     },
     auth::NoAuth,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{domain::account::AccountStorageRequirements, Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient, domain::account::AccountStorageRequirements},
     transaction::{ForeignAccount, TransactionRequestBuilder},
-    ClientError, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{FeeConfig, TutorialNetwork, fund_account_for_fees};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
+    // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
     let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
 
@@ -158,27 +225,30 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Create the Count Reader Contract
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Creating count reader contract.");
 
-    // `include_str!` resolves at compile time relative to this source file,
-    // so the binary is independent of the working directory it is run from.
-    let count_reader_code = include_str!("../masm/accounts/count_reader.masm");
+    // Read the MASM source from the tutorials repository.
+    let count_reader_code =
+        std::fs::read_to_string("../tutorials/masm/accounts/count_reader.masm").unwrap();
 
     let count_reader_slot_name =
         StorageSlotName::new("miden::tutorials::count_reader").expect("valid slot name");
     let count_reader_component_code = client
         .code_builder()
-        .compile_component_code("external_contract::count_reader_contract", count_reader_code)
+        .compile_component_code(
+            "external_contract::count_reader_contract",
+            &count_reader_code,
+        )
         .unwrap();
     let count_reader_component = AccountComponent::new(
         count_reader_component_code,
@@ -196,7 +266,8 @@ async fn main() -> Result<(), ClientError> {
     let count_reader_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
         .with_component(count_reader_component.clone())
-        .with_auth_component(NoAuth)
+        .with_component(BasicWallet)
+        .with_component(NoAuth)
         .build()
         .unwrap();
 
@@ -204,12 +275,13 @@ async fn main() -> Result<(), ClientError> {
         "count_reader hash: {:?}",
         count_reader_contract.to_commitment()
     );
-    println!("contract id: {:?}", count_reader_contract.id());
+    println!("count_reader id: {:?}", count_reader_contract.id());
 
     client
         .add_account(&count_reader_contract, false)
         .await
         .unwrap();
+    fund_account_for_fees(&mut client, count_reader_contract.id(), &fee_config).await?;
 
     Ok(())
 }
@@ -218,22 +290,24 @@ async fn main() -> Result<(), ClientError> {
 Run the following command to execute src/main.rs:
 
 ```bash
-cargo run --release
+TUTORIAL_NETWORK=testnet cargo run --release
 ```
 
-The output of our program will look something like this:
+The output includes the reader's initial commitment and ID (abridged; values vary):
 
 ```text
-Latest block: 226976
+Latest block: <block_number>
 
 [STEP 1] Creating count reader contract.
-count_reader hash: RpoDigest([15888177100833057221, 15548657445961063290, 5580812380698193124, 9604096693288041818])
-contract id: "<testnet_account_id>"
+count_reader hash: Word([...])
+count_reader id: V1(AccountIdV1 { suffix: ..., prefix: ... })
 ```
 
 ## Step 4: Import the pre-deployed counter contract
 
-The FPI call needs a counter contract already deployed on-chain. We import the counter contract that was deployed in the [counter contract tutorial](./counter_contract_tutorial.md) by its testnet address:
+The FPI call needs a counter contract already deployed on-chain. Copy its `mtst1...` testnet account ID into the `MIDEN_COUNTER_ACCOUNT_ID` environment variable. Using an input avoids baking in an address that becomes invalid after a testnet reset.
+
+Insert this fragment inside `main`, immediately before its final `Ok(())`:
 
 ```rust ignore
 // -------------------------------------------------------------------------
@@ -241,9 +315,19 @@ The FPI call needs a counter contract already deployed on-chain. We import the c
 // -------------------------------------------------------------------------
 println!("\n[STEP 2] Building counter contract from public state");
 
-// Define the Counter Contract account id from counter contract deploy
-let (_, counter_contract_id) =
-    AccountId::from_bech32("mtst1apcqs7aj3a2cf5t6pnsfy0p4ns7wl7sp").unwrap();
+// Pass the account ID printed by `counter_contract_deploy` as the first argument, or via
+// `MIDEN_COUNTER_ACCOUNT_ID`.
+let counter_contract_bech32 = std::env::args()
+    .nth(1)
+    .or_else(|| std::env::var("MIDEN_COUNTER_ACCOUNT_ID").ok())
+    .expect("pass the counter account ID from counter_contract_deploy");
+let (account_network, counter_contract_id) =
+    AccountId::from_bech32(&counter_contract_bech32).expect("invalid counter account ID");
+assert_eq!(
+    account_network,
+    network.network_id(),
+    "counter account must match the selected tutorial network"
+);
 
 println!("counter contract id: {:?}", counter_contract_id);
 
@@ -265,7 +349,7 @@ println!(
 
 ## Step 5: Call the counter contract via foreign procedure invocation
 
-Add this snippet to the end of your file in the `main()` function:
+Insert this fragment after the import step, inside `main` and before `Ok(())`:
 
 ```rust ignore
 // -------------------------------------------------------------------------
@@ -273,14 +357,17 @@ Add this snippet to the end of your file in the `main()` function:
 // -------------------------------------------------------------------------
 println!("\n[STEP 3] Call counter contract with FPI from count reader contract");
 
-// Derive the get_count procedure hash from the locally compiled counter library.
-let counter_contract_code = include_str!("../masm/accounts/counter.masm");
+let counter_contract_code =
+    std::fs::read_to_string("../tutorials/masm/accounts/counter.masm").unwrap();
 
 // Compile the counter as a component (same path as the deploy binary) to get
 // the correct procedure root that matches the on-chain MAST.
 let counter_component_code = client
     .code_builder()
-    .compile_component_code("external_contract::counter_contract", counter_contract_code)
+    .compile_component_code(
+        "external_contract::counter_contract",
+        &counter_contract_code,
+    )
     .unwrap();
 let counter_component = AccountComponent::new(
     counter_component_code,
@@ -291,7 +378,6 @@ let counter_component = AccountComponent::new(
 
 let get_count_root = counter_component
     .component_code()
-    .as_library()
     .get_procedure_root_by_path("external_contract::counter_contract::get_count")
     .expect("get_count export not found");
 let get_count_hash = format!("{}", get_count_root);
@@ -300,7 +386,8 @@ println!("get_count hash: {:?}", get_count_hash);
 println!("counter id prefix: {:?}", counter_contract_id.prefix());
 println!("counter id suffix: {:?}", counter_contract_id.suffix());
 
-let script_code = include_str!("../masm/scripts/reader_script.masm")
+let script_code = std::fs::read_to_string("../tutorials/masm/scripts/reader_script.masm")
+    .unwrap()
     .replace("{get_count_proc_hash}", &get_count_hash)
     .replace(
         "{account_id_suffix}",
@@ -315,7 +402,10 @@ let script_code = include_str!("../masm/scripts/reader_script.masm")
 // that compiles the script.
 let tx_script = client
     .code_builder()
-    .with_linked_module("external_contract::count_reader_contract", count_reader_code)
+    .with_linked_module(
+        "external_contract::count_reader_contract",
+        &count_reader_code,
+    )
     .unwrap()
     .compile_tx_script(script_code.as_str())
     .unwrap();
@@ -330,12 +420,13 @@ let tx_request = TransactionRequestBuilder::new()
     .unwrap();
 
 let tx_id = client
-    .submit_new_transaction(count_reader_contract.id(), tx_request)
+    .submit_tutorial_transaction(count_reader_contract.id(), tx_request)
     .await
     .unwrap();
 
 println!(
-    "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+    "View transaction on MidenScan: {}/tx/{:?}",
+    network.explorer_url(),
     tx_id
 );
 
@@ -365,42 +456,56 @@ println!(
     "count reader contract storage: {:?}",
     account_2.storage().get_item(&count_reader_slot_name)
 );
+assert_eq!(
+    account_2
+        .storage()
+        .get_item(&count_reader_slot_name)
+        .unwrap(),
+    account_1.storage().get_item(&counter_slot_name).unwrap(),
+    "FPI must copy the current counter value",
+);
 ```
 
-The key here is the use of the `.foreign_accounts()` method on the `TransactionRequestBuilder`. Using this method, it is possible to create transactions with multiple foreign procedure calls.
+The `.foreign_accounts()` method declares the foreign state that the client must fetch and prove. `AccountStorageRequirements::default()` suffices here because `get_count` reads a value slot. A procedure that reads map entries must also request proofs for the specific map keys it uses. The MASM script performs the actual foreign call.
 
 ## Summary
 
-In this tutorial created a smart contract that calls the `get_count` procedure in the counter contract using foreign procedure invocation, and then saves the returned value to its local storage.
+In this tutorial, we created a smart contract that calls the counter's `get_count` procedure through FPI and saves the returned value in its own storage. The reader account pays for this transaction; the foreign counter is read-only and is not charged or modified.
 
 The final `src/main.rs` file should look like this:
 
 ```rust no_run
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::time::sleep;
 
 use miden_client::{
+    ClientError, Word,
     account::{
-        component::AccountComponentMetadata, AccountBuilder, AccountComponent, AccountId,
-        AccountType, StorageSlot, StorageSlotName,
+        AccountBuilder, AccountComponent, AccountId, AccountType, StorageSlot, StorageSlotName,
+        component::{AccountComponentMetadata, BasicWallet},
     },
     auth::NoAuth,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{domain::account::AccountStorageRequirements, Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient, domain::account::AccountStorageRequirements},
     transaction::{ForeignAccount, TransactionRequestBuilder},
-    ClientError, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{FeeConfig, TutorialNetwork, fund_account_for_fees};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
+    // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
     let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
 
@@ -410,21 +515,21 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Create the Count Reader Contract
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Creating count reader contract.");
 
-    // `include_str!` resolves at compile time relative to this source file,
-    // so the binary is independent of the working directory it is run from.
-    let count_reader_code = include_str!("../masm/accounts/count_reader.masm");
+    // Read the MASM source from the tutorials repository.
+    let count_reader_code =
+        std::fs::read_to_string("../tutorials/masm/accounts/count_reader.masm").unwrap();
 
     let count_reader_slot_name =
         StorageSlotName::new("miden::tutorials::count_reader").expect("valid slot name");
@@ -432,7 +537,7 @@ async fn main() -> Result<(), ClientError> {
         .code_builder()
         .compile_component_code(
             "external_contract::count_reader_contract",
-            count_reader_code,
+            &count_reader_code,
         )
         .unwrap();
     let count_reader_component = AccountComponent::new(
@@ -451,7 +556,8 @@ async fn main() -> Result<(), ClientError> {
     let count_reader_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
         .with_component(count_reader_component.clone())
-        .with_auth_component(NoAuth)
+        .with_component(BasicWallet)
+        .with_component(NoAuth)
         .build()
         .unwrap();
 
@@ -465,15 +571,26 @@ async fn main() -> Result<(), ClientError> {
         .add_account(&count_reader_contract, false)
         .await
         .unwrap();
+    fund_account_for_fees(&mut client, count_reader_contract.id(), &fee_config).await?;
 
     // -------------------------------------------------------------------------
     // STEP 2: Build & Get State of the Counter Contract
     // -------------------------------------------------------------------------
     println!("\n[STEP 2] Building counter contract from public state");
 
-    // Define the Counter Contract account id from counter contract deploy
-    let (_, counter_contract_id) =
-        AccountId::from_bech32("mtst1apcqs7aj3a2cf5t6pnsfy0p4ns7wl7sp").unwrap();
+    // Pass the account ID printed by `counter_contract_deploy` as the first argument, or via
+    // `MIDEN_COUNTER_ACCOUNT_ID`.
+    let counter_contract_bech32 = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("MIDEN_COUNTER_ACCOUNT_ID").ok())
+        .expect("pass the counter account ID from counter_contract_deploy");
+    let (account_network, counter_contract_id) =
+        AccountId::from_bech32(&counter_contract_bech32).expect("invalid counter account ID");
+    assert_eq!(
+        account_network,
+        network.network_id(),
+        "counter account must match the selected tutorial network"
+    );
 
     println!("counter contract id: {:?}", counter_contract_id);
 
@@ -497,13 +614,17 @@ async fn main() -> Result<(), ClientError> {
     // -------------------------------------------------------------------------
     println!("\n[STEP 3] Call counter contract with FPI from count reader contract");
 
-    let counter_contract_code = include_str!("../masm/accounts/counter.masm");
+    let counter_contract_code =
+        std::fs::read_to_string("../tutorials/masm/accounts/counter.masm").unwrap();
 
     // Compile the counter as a component (same path as the deploy binary) to get
     // the correct procedure root that matches the on-chain MAST.
     let counter_component_code = client
         .code_builder()
-        .compile_component_code("external_contract::counter_contract", counter_contract_code)
+        .compile_component_code(
+            "external_contract::counter_contract",
+            &counter_contract_code,
+        )
         .unwrap();
     let counter_component = AccountComponent::new(
         counter_component_code,
@@ -514,7 +635,6 @@ async fn main() -> Result<(), ClientError> {
 
     let get_count_root = counter_component
         .component_code()
-        .as_library()
         .get_procedure_root_by_path("external_contract::counter_contract::get_count")
         .expect("get_count export not found");
     let get_count_hash = format!("{}", get_count_root);
@@ -523,7 +643,8 @@ async fn main() -> Result<(), ClientError> {
     println!("counter id prefix: {:?}", counter_contract_id.prefix());
     println!("counter id suffix: {:?}", counter_contract_id.suffix());
 
-    let script_code = include_str!("../masm/scripts/reader_script.masm")
+    let script_code = std::fs::read_to_string("../tutorials/masm/scripts/reader_script.masm")
+        .unwrap()
         .replace("{get_count_proc_hash}", &get_count_hash)
         .replace(
             "{account_id_suffix}",
@@ -538,14 +659,16 @@ async fn main() -> Result<(), ClientError> {
     // that compiles the script.
     let tx_script = client
         .code_builder()
-        .with_linked_module("external_contract::count_reader_contract", count_reader_code)
+        .with_linked_module(
+            "external_contract::count_reader_contract",
+            &count_reader_code,
+        )
         .unwrap()
         .compile_tx_script(script_code.as_str())
         .unwrap();
 
     let foreign_account =
-        ForeignAccount::public(counter_contract_id, AccountStorageRequirements::default())
-            .unwrap();
+        ForeignAccount::public(counter_contract_id, AccountStorageRequirements::default()).unwrap();
 
     let tx_request = TransactionRequestBuilder::new()
         .foreign_accounts([foreign_account])
@@ -554,12 +677,13 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
 
     let tx_id = client
-        .submit_new_transaction(count_reader_contract.id(), tx_request)
+        .submit_tutorial_transaction(count_reader_contract.id(), tx_request)
         .await
         .unwrap();
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
@@ -589,21 +713,31 @@ async fn main() -> Result<(), ClientError> {
         "count reader contract storage: {:?}",
         account_2.storage().get_item(&count_reader_slot_name)
     );
+    assert_eq!(
+        account_2
+            .storage()
+            .get_item(&count_reader_slot_name)
+            .unwrap(),
+        account_1.storage().get_item(&counter_slot_name).unwrap(),
+        "FPI must copy the current counter value",
+    );
 
     Ok(())
 }
 ```
 
-The output will show the count reader contract being created, the counter contract being imported from testnet, and finally both storage slots reflecting the same count value after the FPI transaction is confirmed.
+Run the standalone project with `TUTORIAL_NETWORK=testnet cargo run --release`. With `MIDEN_COUNTER_ACCOUNT_ID` set, the output shows the reader being created, the counter imported from testnet, and both storage slots containing the same count after the FPI transaction is confirmed. The final assertion assumes the counter is not concurrently incremented while the example runs; use a fresh counter for this check.
 
 ### Running the example
 
-To run the full example, navigate to the `rust-client` directory in the [miden-tutorials](https://github.com/0xMiden/miden-tutorials/) repository and run this command:
+To run the checked-in example, return to the root of the [tutorials repository](https://github.com/0xMiden/tutorials/) and run:
 
 ```bash
 cd rust-client
-cargo run --release --bin counter_contract_fpi
+TUTORIAL_NETWORK=testnet cargo run --release --bin counter_contract_fpi -- "$MIDEN_COUNTER_ACCOUNT_ID"
 ```
+
+If `MIDEN_COUNTER_ACCOUNT_ID` is exported in your shell, you can omit `--` and the final argument.
 
 ### Continue learning
 

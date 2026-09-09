@@ -1,21 +1,26 @@
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
 
 use miden_client::{
     account::{AccountId, StorageSlotName},
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient},
     transaction::TransactionRequestBuilder,
     ClientError,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::TutorialNetwork;
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -27,7 +32,6 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
@@ -39,9 +43,19 @@ async fn main() -> Result<(), ClientError> {
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Reading data from public state");
 
-    // Define the Counter Contract account id from counter contract deploy
-    let (_, counter_contract_id) =
-        AccountId::from_bech32("mtst1apcqs7aj3a2cf5t6pnsfy0p4ns7wl7sp").unwrap();
+    // Pass the account ID printed by `counter_contract_deploy` as the first argument, or via
+    // `MIDEN_COUNTER_ACCOUNT_ID`.
+    let counter_contract_bech32 = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("MIDEN_COUNTER_ACCOUNT_ID").ok())
+        .expect("pass the counter account ID from counter_contract_deploy");
+    let (account_network, counter_contract_id) =
+        AccountId::from_bech32(&counter_contract_bech32).expect("invalid counter account ID");
+    assert_eq!(
+        account_network,
+        network.network_id(),
+        "counter account must match the selected tutorial network"
+    );
 
     client
         .import_account_by_id(counter_contract_id)
@@ -57,6 +71,12 @@ async fn main() -> Result<(), ClientError> {
         "Account details: {:?}",
         counter_contract.storage().slots().first().unwrap()
     );
+    let counter_slot_name =
+        StorageSlotName::new("miden::tutorials::counter").expect("valid slot name");
+    let count_before = counter_contract
+        .storage()
+        .get_item(&counter_slot_name)
+        .unwrap()[0];
 
     // -------------------------------------------------------------------------
     // STEP 2: Call the Counter Contract with a script
@@ -85,12 +105,13 @@ async fn main() -> Result<(), ClientError> {
 
     // Execute and submit the transaction
     let tx_id = client
-        .submit_new_transaction(counter_contract_id, tx_increment_request)
+        .submit_tutorial_transaction(counter_contract_id, tx_increment_request)
         .await
         .unwrap();
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
@@ -102,11 +123,14 @@ async fn main() -> Result<(), ClientError> {
         .await
         .unwrap()
         .expect("counter contract not found");
-    let counter_slot_name =
-        StorageSlotName::new("miden::tutorials::counter").expect("valid slot name");
     println!(
         "counter contract storage: {:?}",
         account.storage().get_item(&counter_slot_name)
+    );
+    assert_eq!(
+        account.storage().get_item(&counter_slot_name).unwrap()[0],
+        count_before + miden_client::ONE,
+        "the imported counter must increment exactly once",
     );
     Ok(())
 }

@@ -5,6 +5,13 @@ sidebar_position: 5
 
 _Using the Miden client to interact with a custom smart contract_
 
+:::note v0.16 setup
+
+Follow the [network and fee setup](./setup_guide.md#network-and-fee-setup)
+and copy the shared support files imported by the complete example.
+
+:::
+
 ## Overview
 
 In this tutorial, we will deploy a custom counter smart contract and increment its count using the Miden client. Each run creates a fresh counter account, deploys it to the network, and immediately calls its `increment_count` procedure via a transaction script — so the final count is always `1`.
@@ -42,7 +49,7 @@ This tutorial assumes you have a basic understanding of Miden assembly. To quick
 
 3. Install the Miden SDK:
    ```bash
-   yarn add @miden-sdk/miden-sdk@0.15.2
+   yarn add @miden-sdk/miden-sdk@0.16.0
    ```
 
 **NOTE!**: Be sure to add the `--webpack` command to your `package.json` when running the `dev script`. The dev script should look like this:
@@ -111,35 +118,53 @@ Create the file `lib/masm/counter_contract.masm` with the following Miden Assemb
 ```masm
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNTER_SLOT = word("miden::tutorials::counter")
 
-#! Inputs:  []
-#! Outputs: [count]
-pub proc get_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Returns the current count.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [count, pad(15)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_count() -> felt
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     exec.sys::truncate_stack
-    # => [count]
+    # => [count, pad(15)]
 end
 
-#! Inputs:  []
-#! Outputs: []
-pub proc increment_count
+#! Increments the current count by one.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc increment_count()
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     add.1
-    # => [count+1]
+    # => [[count + 1, 0, 0, 0], pad(16)]
 
     push.COUNTER_SLOT[0..2] exec.native_account::set_item
-    # => []
+    # => [OLD_VALUE, pad(16)]
+
+    dropw
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
@@ -193,11 +218,14 @@ Copy and paste the following code into the `lib/incrementCounterContract.ts` fil
 import counterContractCode from './masm/counter_contract.masm';
 import {
   AuthSecretKey,
-  StorageMode,
   StorageSlot,
   StorageResult,
-  MidenClient,
 } from '@miden-sdk/miden-sdk/lazy';
+import {
+  createFundableContractAccount,
+  createTutorialClient,
+  fundAccountForFees,
+} from './feeSupport';
 
 export async function incrementCounterContract(): Promise<void> {
   if (typeof window === 'undefined') {
@@ -205,17 +233,11 @@ export async function incrementCounterContract(): Promise<void> {
     return;
   }
 
-  // Wait for the WASM module to finish initializing before touching any
-  // wasm-bindgen type (see setup_guide.md "Entry points: eager vs lazy").
-  await MidenClient.ready();
-
-  const nodeEndpoint = 'https://rpc.testnet.miden.io';
-  const client = await MidenClient.create({ rpcUrl: nodeEndpoint });
+  const client = await createTutorialClient({ proverUrl: 'local' });
   console.log('Current block number: ', (await client.sync()).blockNum());
 
   const counterSlotName = 'miden::tutorials::counter';
 
-  // Compile the counter component
   const counterAccountComponent = await client.compile.component({
     code: counterContractCode,
     slots: [StorageSlot.emptyValue(counterSlotName)],
@@ -223,23 +245,37 @@ export async function incrementCounterContract(): Promise<void> {
 
   const walletSeed = new Uint8Array(32);
   crypto.getRandomValues(walletSeed);
-
   const auth = AuthSecretKey.rpoFalconWithRNG(walletSeed);
 
-  // Create the counter contract account
-  const account = await client.accounts.create({
-    storage: StorageMode.Public,
-    seed: walletSeed,
+  const account = await createFundableContractAccount(
+    client,
+    walletSeed,
     auth,
-    components: [counterAccountComponent],
-  });
+    [counterAccountComponent],
+  );
 
-  // Building the transaction script which will call the counter contract
+  await fundAccountForFees(client, account);
+
   const txScriptCode = `
-    use external_contract::counter_contract
-    begin
+use external_contract::counter_contract
+
+#! Increments the counter.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
     call.counter_contract::increment_count
-    end
+    # => [pad(16)]
+end
 `;
 
   const script = await client.compile.txScript({
@@ -252,27 +288,26 @@ export async function incrementCounterContract(): Promise<void> {
     ],
   });
 
-  // Executing the transaction script against the counter contract — this
-  // deploys the counter and runs `increment_count` in a single transaction.
-  await client.transactions.execute({
+  await client.sync();
+  const { txId } = await client.transactions.execute({
     account,
     script,
+    waitForConfirmation: true,
+    timeout: 120_000,
   });
+  console.log(`Transaction committed: ${txId.toHex()}`);
 
   console.log('Counter contract ID:', account.id().toString());
 
-  // Logging the count of the counter contract we just incremented
   const counter = await client.accounts.get(account);
-
   // `getItem()` is typed to return a low-level `Word`, but at runtime the SDK
   // wraps the slot in a `StorageResult` whose `toBigInt()` reads the first
   // felt — the count. The cast reflects that runtime type.
   const count = counter?.storage().getItem(counterSlotName) as unknown as
-    | StorageResult
-    | undefined;
-
+    StorageResult | undefined;
   const counterValue = Number(count!.toBigInt());
-
+  if (counterValue !== 1)
+    throw new Error(`Expected counter 1, got ${counterValue}`);
   console.log('Count: ', counterValue);
 }
 ```
@@ -312,52 +347,74 @@ Count:  1
 4. Adds `1` to the count value returned from `active_account::get_item`.
 5. Pushes the slot ID prefix and suffix again so we can write the updated count.
 6. Calls `native_account::set_item` which saves the incremented count to storage.
-7. Calls `sys::truncate_stack` to truncate the stack to size 16.
+7. Drops the previous storage word returned by `set_item`.
+8. Calls `sys::truncate_stack` to leave only the 16 padding elements.
 
 ```masm
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNTER_SLOT = word("miden::tutorials::counter")
 
-#! Inputs:  []
-#! Outputs: [count]
-pub proc get_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Returns the current count.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [count, pad(15)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_count() -> felt
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     exec.sys::truncate_stack
-    # => [count]
+    # => [count, pad(15)]
 end
 
-#! Inputs:  []
-#! Outputs: []
-pub proc increment_count
+#! Increments the current count by one.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc increment_count()
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     add.1
-    # => [count+1]
+    # => [[count + 1, 0, 0, 0], pad(16)]
 
     push.COUNTER_SLOT[0..2] exec.native_account::set_item
-    # => []
+    # => [OLD_VALUE, pad(16)]
+
+    dropw
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
-**Note**: _It's a good habit to add comments below each line of MASM code with the expected stack state. This improves readability and helps with debugging._
+The examples follow the [protocol MASM conventions](https://github.com/0xMiden/protocol/tree/next/.claude/skills): public procedures declare typed signatures and invocation style, and stack comments list the top element first. Calls return 16 stack elements, including `pad(N)` padding; storage values are four-element words.
 
 ### Authentication Component
 
-**Important**: All accounts must have an authentication component. For smart contracts that do not require authentication (like our counter contract), we use a `NoAuth` component.
+The counter uses a Falcon single-signature authentication component. The client
+stores the secret key and signs transactions that increment the counter. Public
+storage lets other accounts read its state through FPI; it does not grant them
+permission to update it.
 
-This `NoAuth` component allows any user to interact with the smart contract without requiring signature verification.
-
-**Note**: _Adding the `account::incr_nonce` to a state changing procedure allows any user to call the procedure._
+The account also includes `BasicWallet` so it can consume a native-asset funding
+note and pay transaction fees. The `createFundableContractAccount` helper adds
+both components and registers the account and key in the client.
 
 ### Compiling the account component
 
@@ -372,17 +429,19 @@ const counterAccountComponent = await client.compile.component({
 
 ### Creating the contract account
 
-Use `client.accounts.create()` to build and register the contract. Passing `components` makes this a contract account, so no account type is needed — `storage` selects visibility (`StorageMode.Public` here). You must supply a `seed` (for deterministic ID derivation) and a raw `AuthSecretKey` — the client stores the key automatically:
+Use the repository helper to build the account with authentication, the custom
+counter component, and `BasicWallet`, then fund it before executing a script:
 
 ```ts
 const auth = AuthSecretKey.rpoFalconWithRNG(walletSeed);
 
-const account = await client.accounts.create({
-  storage: StorageMode.Public,
-  seed: walletSeed,
+const account = await createFundableContractAccount(
+  client,
+  walletSeed,
   auth,
-  components: [counterAccountComponent],
-});
+  [counterAccountComponent],
+);
+await fundAccountForFees(client, account);
 ```
 
 ### Compiling and executing the custom script
@@ -401,12 +460,15 @@ const script = await client.compile.txScript({
 });
 ```
 
-Then execute it with `client.transactions.execute()`:
+Synchronize, execute the script, and wait for commitment:
 
 ```ts
+await client.sync();
 await client.transactions.execute({
   account,
   script,
+  waitForConfirmation: true,
+  timeout: 120_000,
 });
 ```
 
@@ -417,8 +479,22 @@ This is the Miden assembly script that calls the `increment_count` procedure dur
 ```masm
 use external_contract::counter_contract
 
-begin
+#! Increments the counter.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
     call.counter_contract::increment_count
+    # => [pad(16)]
 end
 ```
 
@@ -429,7 +505,7 @@ To run a full working example navigate to the `web-client` directory in the [mid
 ```bash
 cd web-client
 yarn install
-yarn start
+yarn dev
 ```
 
 ### Resetting the `MidenClientDB`

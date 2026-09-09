@@ -1,67 +1,46 @@
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 use miden_client::{
     account::{
         component::{
-            BasicWallet, BurnPolicyConfig, FungibleFaucet, MintPolicyConfig, PolicyRegistration,
-            TokenName, TokenPolicyManager,
+            create_singlesig_user_fungible_faucet, BasicWallet, BurnPolicy, FungibleFaucet,
+            MintPolicy, TokenName, TokenPolicyManager,
         },
         AccountBuilder, AccountType,
     },
-    address::NetworkId,
-    asset::{AssetAmount, AssetCallbackFlag, AssetVaultKey, FungibleAsset, TokenSymbol},
-    auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
+    asset::{AssetAmount, AssetId, FungibleAsset, TokenSymbol},
+    auth::{AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,
     keystore::{FilesystemKeyStore, Keystore},
-    note::{Note, NoteAttachments, NoteType, P2idNote},
-    rpc::{Endpoint, GrpcClient},
-    store::TransactionFilter,
-    transaction::{TransactionId, TransactionRequestBuilder, TransactionStatus},
+    note::{Note, NoteType, P2idNote},
+    rpc::{GrpcClient, VerifyingRpcClient},
+    transaction::{TransactionId, TransactionRequestBuilder},
     utils::{Deserializable, Serializable},
     Client, ClientError,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{fund_account_for_fees, FeeConfig, TutorialNetwork};
 
 /// Waits for a specific transaction to be committed.
 async fn wait_for_tx(
     client: &mut Client<FilesystemKeyStore>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
+    rust_client::wait_for_transaction(client, tx_id).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -73,12 +52,12 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     //------------------------------------------------------------
     // STEP 1: Deploy a fungible faucet
@@ -98,38 +77,40 @@ async fn main() -> Result<(), ClientError> {
     let max_supply = AssetAmount::new(1_000_000).unwrap();
 
     // Build the account
-    let faucet_account = AccountBuilder::new(init_seed)
-        .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
-        .with_component(
-            FungibleFaucet::builder()
-                .name(TokenName::new("MID").unwrap())
-                .symbol(symbol)
-                .decimals(decimals)
-                .max_supply(max_supply)
-                .build()
-                .unwrap(),
-        )
-        .with_components(
-            TokenPolicyManager::new()
-                .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
-                .unwrap()
-                .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
-                .unwrap(),
-        )
+    let faucet = FungibleFaucet::builder()
+        .name(TokenName::new("MID").unwrap())
+        .symbol(symbol)
+        .decimals(decimals)
+        .max_supply(max_supply)
         .build()
         .unwrap();
+    let policies = TokenPolicyManager::builder()
+        .active_mint_policy(MintPolicy::allow_all())
+        .active_burn_policy(BurnPolicy::allow_all())
+        .build();
+    let faucet_account = create_singlesig_user_fungible_faucet(
+        init_seed,
+        faucet,
+        AuthSingleSig::from_public_key(key_pair.public_key()),
+        policies,
+        AccountType::Public,
+    )
+    .unwrap();
 
     // Add the faucet to the client
     client.add_account(&faucet_account, false).await?;
 
     println!(
         "Faucet account ID: {}",
-        faucet_account.id().to_bech32(NetworkId::Testnet)
+        faucet_account.id().to_bech32(network.network_id())
     );
 
     // Add the key pair to the keystore
-    keystore.add_key(&key_pair, faucet_account.id()).await.unwrap();
+    keystore
+        .add_key(&key_pair, faucet_account.id())
+        .await
+        .unwrap();
+    fund_account_for_fees(&mut client, faucet_account.id(), &fee_config).await?;
 
     // Resync to show newly deployed faucet
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -151,7 +132,7 @@ async fn main() -> Result<(), ClientError> {
 
         let account = AccountBuilder::new(init_seed)
             .account_type(AccountType::Public)
-            .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
+            .with_component(AuthSingleSig::from_public_key(key_pair.public_key()))
             .with_component(BasicWallet)
             .build()
             .unwrap();
@@ -160,12 +141,13 @@ async fn main() -> Result<(), ClientError> {
         println!(
             "account id {:?}: {}",
             i,
-            account.id().to_bech32(NetworkId::Testnet)
+            account.id().to_bech32(network.network_id())
         );
         client.add_account(&account, true).await?;
 
         // Add the key pair to the keystore
         keystore.add_key(&key_pair, account.id()).await.unwrap();
+        fund_account_for_fees(&mut client, account.id(), &fee_config).await?;
     }
 
     // For demo purposes, Alice is the first account.
@@ -188,7 +170,7 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
 
     let tx_id = client
-        .submit_new_transaction(faucet_account.id(), transaction_request)
+        .submit_tutorial_transaction(faucet_account.id(), transaction_request)
         .await?;
     println!("Minted tokens. TX: {:?}", tx_id);
 
@@ -196,7 +178,9 @@ async fn main() -> Result<(), ClientError> {
     wait_for_tx(&mut client, tx_id).await?;
 
     // Get the minted note and consume it
-    let consumable_notes = client.get_consumable_notes(Some(alice.id())).await?;
+    let consumable_notes = client
+        .get_consumable_tutorial_notes(Some(alice.id()))
+        .await?;
 
     if let Some((note_record, _)) = consumable_notes.first() {
         let note: Note = note_record.clone().try_into()?;
@@ -204,7 +188,7 @@ async fn main() -> Result<(), ClientError> {
             TransactionRequestBuilder::new().build_consume_notes(vec![note])?;
 
         let consume_tx_id = client
-            .submit_new_transaction(alice.id(), transaction_request)
+            .submit_tutorial_transaction(alice.id(), transaction_request)
             .await?;
         println!("Consumed minted note. TX: {:?}", consume_tx_id);
 
@@ -221,10 +205,13 @@ async fn main() -> Result<(), ClientError> {
     for i in 0..number_of_accounts - 1 {
         let loop_start = Instant::now();
         println!("\nunauthenticated tx {:?}", i + 1);
-        println!("sender: {}", accounts[i].id().to_bech32(NetworkId::Testnet));
+        println!(
+            "sender: {}",
+            accounts[i].id().to_bech32(network.network_id())
+        );
         println!(
             "target: {}",
-            accounts[i + 1].id().to_bech32(NetworkId::Testnet)
+            accounts[i + 1].id().to_bech32(network.network_id())
         );
 
         // Time the creation of the p2id note
@@ -239,15 +226,15 @@ async fn main() -> Result<(), ClientError> {
             NoteType::Public
         };
 
-        let p2id_note = P2idNote::create(
-            accounts[i].id(),
-            accounts[i + 1].id(),
-            vec![fungible_asset_send_amount.into()],
-            note_type,
-            NoteAttachments::empty(),
-            client.rng(),
-        )
-        .unwrap();
+        let p2id_note: Note = P2idNote::builder()
+            .sender(accounts[i].id())
+            .target(accounts[i + 1].id())
+            .asset(fungible_asset_send_amount)
+            .note_type(note_type)
+            .generate_serial_number(client.rng())
+            .build()
+            .unwrap()
+            .into();
 
         let output_note = p2id_note.clone();
 
@@ -257,10 +244,12 @@ async fn main() -> Result<(), ClientError> {
             .build()
             .unwrap();
 
-        let tx_id = client
+        // Do not wait for inclusion: the receiver is given the complete note below.
+        client.sync_state().await?;
+        let send_tx_id = client
             .submit_new_transaction(accounts[i].id(), transaction_request)
             .await?;
-        println!("Created note. TX: {:?}", tx_id);
+        println!("Created note. TX: {:?}", send_tx_id);
 
         // Note serialization/deserialization
         // This demonstrates how you could send the serialized note to another client instance
@@ -268,17 +257,17 @@ async fn main() -> Result<(), ClientError> {
         let deserialized_p2id_note = Note::read_from_bytes(&serialized).unwrap();
 
         // Time consume note request building
-        let consume_note_request = TransactionRequestBuilder::new()
-            .input_notes([(deserialized_p2id_note, None)])
-            .build()
-            .unwrap();
+        let consume_note_request =
+            TransactionRequestBuilder::new().build_consume_notes(vec![deserialized_p2id_note])?;
 
         let tx_id = client
-            .submit_new_transaction(accounts[i + 1].id(), consume_note_request)
+            .submit_tutorial_transaction(accounts[i + 1].id(), consume_note_request)
             .await?;
+        rust_client::wait_for_transaction(&mut client, send_tx_id).await?;
 
         println!(
-            "Consumed Note Tx on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+            "Consumed Note Tx on MidenScan: {}/tx/{:?}",
+            network.explorer_url(),
             tx_id
         );
         println!(
@@ -296,19 +285,28 @@ async fn main() -> Result<(), ClientError> {
     // Final resync and display account balances
     tokio::time::sleep(Duration::from_secs(3)).await;
     client.sync_state().await?;
-    for account in accounts.clone() {
+    for (index, account) in accounts.iter().enumerate() {
         let new_account = client.get_account(account.id()).await.unwrap().unwrap();
         let balance = new_account
             .vault()
-            .get_balance(AssetVaultKey::new_fungible(
-                faucet_account.id(),
-                AssetCallbackFlag::Disabled,
-            ))
+            .get_balance(AssetId::new_fungible(faucet_account.id()))
             .unwrap();
         println!(
             "Account: {} balance: {}",
-            account.id().to_bech32(NetworkId::Testnet),
+            account.id().to_bech32(network.network_id()),
             balance
+        );
+        let expected = if index == 0 {
+            80
+        } else if index == accounts.len() - 1 {
+            20
+        } else {
+            0
+        };
+        assert_eq!(
+            balance.as_u64(),
+            expected,
+            "unexpected transfer-chain balance"
         );
     }
 
