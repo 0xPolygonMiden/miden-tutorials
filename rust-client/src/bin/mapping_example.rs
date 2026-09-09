@@ -1,26 +1,32 @@
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
 
 use miden_client::{
     account::{
-        component::AccountComponentMetadata, AccountBuilder, AccountComponent,
-        AccountType, StorageMap, StorageSlot, StorageSlotName,
+        component::{AccountComponentMetadata, BasicWallet},
+        AccountBuilder, AccountComponent, AccountType, StorageMap, StorageMapKey, StorageSlot,
+        StorageSlotName,
     },
     auth::NoAuth,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient},
     transaction::TransactionRequestBuilder,
-    ClientError, Felt, Word,
+    ClientError,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{fund_account_for_fees, FeeConfig, TutorialNetwork};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -32,29 +38,23 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Deploy a smart contract with a mapping
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Deploy a smart contract with a mapping");
 
-    // Load the MASM file for the counter contract. `include_str!` resolves at
+    // Load the MASM file for the mapping contract. `include_str!` resolves at
     // compile time relative to this source file.
     let account_code = include_str!("../../../masm/accounts/mapping_example_contract.masm");
 
-    // Using an empty storage value in slot 0 since this is usually reserved
-    // for the account pub_key and metadata
-    let empty_slot_name =
-        StorageSlotName::new("miden::tutorials::mapping::value").expect("valid slot name");
-    let empty_storage_slot = StorageSlot::with_value(empty_slot_name.clone(), Word::default());
-
-    // initialize storage map
+    // Storage slots are named in v0.16; the component only needs its mapping slot.
     let storage_map = StorageMap::new();
     let map_slot_name =
         StorageSlotName::new("miden::tutorials::mapping::map").expect("valid slot name");
@@ -67,7 +67,7 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
     let mapping_contract_component = AccountComponent::new(
         component_code,
-        vec![empty_storage_slot, storage_slot_map],
+        vec![storage_slot_map],
         AccountComponentMetadata::new("miden_by_example::mapping_example_contract"),
     )
     .unwrap();
@@ -80,7 +80,8 @@ async fn main() -> Result<(), ClientError> {
     let mapping_example_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
         .with_component(mapping_contract_component.clone())
-        .with_auth_component(NoAuth)
+        .with_component(BasicWallet)
+        .with_component(NoAuth)
         .build()
         .unwrap();
 
@@ -88,6 +89,7 @@ async fn main() -> Result<(), ClientError> {
         .add_account(&mapping_example_contract, false)
         .await
         .unwrap();
+    fund_account_for_fees(&mut client, mapping_example_contract.id(), &fee_config).await?;
 
     // -------------------------------------------------------------------------
     // STEP 2: Call the Mapping Contract with a Script
@@ -113,12 +115,13 @@ async fn main() -> Result<(), ClientError> {
 
     // Execute and submit the transaction
     let tx_id = client
-        .submit_new_transaction(mapping_example_contract.id(), tx_increment_request)
+        .submit_tutorial_transaction(mapping_example_contract.id(), tx_increment_request)
         .await
         .unwrap();
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
@@ -129,18 +132,21 @@ async fn main() -> Result<(), ClientError> {
         .await
         .unwrap()
         .expect("mapping contract not found");
-    let key = [
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-    ]
-    .into();
+    let key = StorageMapKey::empty();
     println!(
         "Mapping state\n Index: {:?}\n Key: {:?}\n Value: {:?}",
         map_slot_name,
         key,
         account.storage().get_map_item(&map_slot_name, key)
+    );
+    let value = account.storage().get_map_item(&map_slot_name, key).unwrap();
+    assert_eq!(
+        value
+            .iter()
+            .map(|felt| felt.as_canonical_u64())
+            .collect::<Vec<_>>(),
+        vec![4, 3, 2, 1],
+        "the mapping must store the value written by the transaction script",
     );
 
     Ok(())

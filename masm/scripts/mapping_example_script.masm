@@ -1,25 +1,40 @@
 use miden_by_example::mapping_example_contract
 use miden::core::sys
 
-begin
+#! Writes a mapping entry, reads it, and returns the current map root.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [CURRENT_ROOT, pad(12)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#! - CURRENT_ROOT is the mapping's Merkle root after the write.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word) -> word
+    dropw
+    # => [pad(16)]
+
     push.1.2.3.4
     push.0.0.0.0
-    # => [KEY, VALUE]
+    # => [KEY, VALUE, pad(16)]
 
     call.mapping_example_contract::write_to_map
-    # => []
+    # => [pad(24)]
 
     push.0.0.0.0
-    # => [KEY]
+    # => [KEY, pad(24)]
 
     call.mapping_example_contract::get_value_in_map
-    # => [VALUE]
+    # => [VALUE, pad(24)]
 
     dropw
-    # => []
+    # => [pad(24)]
 
     call.mapping_example_contract::get_current_map_root
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(20)]
 
     exec.sys::truncate_stack
+    # => [CURRENT_ROOT, pad(12)]
 end

@@ -5,23 +5,22 @@
  * @throws {Error} If the function cannot be executed in a browser environment
  */
 import {
-  MidenClient,
+  NoteArray,
   NoteVisibility,
   StorageMode,
   createP2IDNote,
-  NoteArray,
-  TransactionRequestBuilder,
 } from '@miden-sdk/miden-sdk/lazy';
+import {
+  consumeAllFeeAware,
+  createTutorialClient,
+  fundAccountForFees,
+} from './feeSupport';
 
 export async function multiSendWithDelegatedProver(): Promise<void> {
   // Ensure this runs only in a browser context
   if (typeof window === 'undefined') return console.warn('Run in browser');
 
-  await MidenClient.ready();
-
-  const client = await MidenClient.create({
-    rpcUrl: 'https://rpc.testnet.miden.io',
-  });
+  const client = await createTutorialClient();
 
   console.log('Latest block:', (await client.sync()).blockNum());
 
@@ -32,7 +31,7 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
   });
   console.log('Alice account ID:', alice.id().toString());
 
-  // ── Creating new faucet ──────────────────────────────────────────────────────
+  // ── Creating new faucet ────────────────────────────────────────────────────
   const faucet = await client.accounts.create({
     type: 0, // 0 = FungibleFaucet
     symbol: 'MID',
@@ -41,29 +40,30 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
     storage: StorageMode.Public,
   });
   console.log('Faucet ID:', faucet.id().toString());
+  await fundAccountForFees(client, alice);
+  await fundAccountForFees(client, faucet);
 
-  // ── mint 10 000 MID to Alice ──────────────────────────────────────────────────────
+  // ── mint 10 000 MID to Alice ───────────────────────────────────────────────
+  await client.sync();
   const { txId: mintTxId } = await client.transactions.mint({
     account: faucet,
     to: alice,
     amount: BigInt(10_000),
     type: NoteVisibility.Public,
   });
-
   console.log('waiting for settlement');
-  await client.transactions.waitFor(mintTxId);
-
-  // ── consume the freshly minted notes ──────────────────────────────────────────────
-  await client.transactions.consumeAll({
-    account: alice,
-  });
+  await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
+  await consumeAllFeeAware(client, alice);
 
   // ── build 3 P2ID notes (100 MID each) ─────────────────────────────────────────────
-  const recipientAddresses = [
-    'mtst1arqeemdpnzu4k52wlpd3xekl5uklfjl5',
-    'mtst1arqk5qt3kms0cut9rdtqdaz8y5xmj245',
-    'mtst1aq6kyfrh23n9gvt6jkg0z7fyts99hdqr',
-  ];
+  const recipients = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      client.accounts.create({ storage: StorageMode.Public }),
+    ),
+  );
+  const recipientAddresses = recipients.map((account) =>
+    account.id().toString(),
+  );
 
   const p2idNotes = recipientAddresses.map((addr) =>
     createP2IDNote({
@@ -75,9 +75,18 @@ export async function multiSendWithDelegatedProver(): Promise<void> {
   );
 
   // ── create all P2ID notes ───────────────────────────────────────────────────────────────
-  const builder = new TransactionRequestBuilder();
-  const txRequest = builder.withOwnOutputNotes(new NoteArray(p2idNotes)).build();
-  await client.transactions.submit(alice, txRequest);
+  await client.sync();
+  const builder = await client.feeAwareTransactionRequestBuilder(alice);
+  const outputs = new NoteArray();
+  for (const note of p2idNotes) outputs.push(note);
+  const request = builder.withOwnOutputNotes(outputs).build();
+  const { txId } = await client.transactions.submit(alice, request);
+  await client.transactions.waitFor(txId, { timeout: 120_000 });
+  console.log(`Transaction committed: ${txId.toHex()}`);
+  const updatedAlice = await client.accounts.get(alice);
+  const balance = updatedAlice?.vault().getBalance(faucet.id());
+  if (balance !== BigInt(9_700))
+    throw new Error(`Expected Alice to retain 9700 MID, got ${balance}`);
 
   console.log('All notes created ✅');
 }

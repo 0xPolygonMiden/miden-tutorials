@@ -7,6 +7,8 @@ sidebar_position: 10
 
 _Using mappings in Miden assembly for storing key value pairs_
 
+For toolchain requirements and shared fee helpers, see the [Rust client setup](./index.md#running-the-v016-examples).
+
 ## Overview
 
 In this example, we will explore how to use mappings in Miden Assembly. Mappings are essential data structures that store key-value pairs. We will demonstrate how to create an account that contains a mapping and then call a procedure in that account to update the mapping.
@@ -16,8 +18,7 @@ At a high level, this example involves:
 - Setting up an account with a mapping stored in one of its storage slots.
 - Writing a smart contract in Miden Assembly that includes procedures to read from and write to the mapping.
 - Creating a transaction script that calls these procedures.
-- Using Rust code to deploy the account and submit a transaction that updates the mapping.  
-  After the Miden Assembly snippets, we explain that the transaction script calls a procedure in the account. This procedure then updates the mapping by modifying the mapping stored in the account's storage slot.
+- Using Rust code to deploy the account and submit a transaction that updates the mapping.
 
 ## What we'll cover
 
@@ -42,46 +43,67 @@ At a high level, this example involves:
 ```masm
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+use {StorageMapKey} from miden::protocol::types
+
+# CONSTANTS
+# =================================================================================================
 
 const MAP_SLOT = word("miden::tutorials::mapping::map")
 
-# Inputs: [KEY, VALUE]
-# Outputs: []
-pub proc write_to_map
-    # The storage map is in the mapping slot.
-    push.MAP_SLOT[0..2]
-    # => [slot_id_prefix, slot_id_suffix, KEY, VALUE]
+# PUBLIC INTERFACE
+# =================================================================================================
 
-    # Setting the key value pair in the map
+#! Stores VALUE under KEY in the mapping.
+#!
+#! Inputs:  [KEY, VALUE, pad(8)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc write_to_map(key: StorageMapKey, value: word)
+    # the storage map is in the mapping slot
+    push.MAP_SLOT[0..2]
+    # => [slot_id_suffix, slot_id_prefix, KEY, VALUE, pad(8)]
+
+    # set the key-value pair in the map
     exec.native_account::set_map_item
-    # => [OLD_VALUE]
+    # => [OLD_VALUE, pad(12)]
 
     dropw
-    # => []
+    # => [pad(16)]
 end
 
-# Inputs: [KEY]
-# Outputs: [VALUE]
-pub proc get_value_in_map
-    # The storage map is in the mapping slot.
+#! Returns the VALUE stored under KEY in the mapping.
+#!
+#! Inputs:  [KEY, pad(12)]
+#! Outputs: [VALUE, pad(12)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_value_in_map(key: StorageMapKey) -> word
+    # the storage map is in the mapping slot
     push.MAP_SLOT[0..2]
-    # => [slot_id_prefix, slot_id_suffix, KEY]
+    # => [slot_id_suffix, slot_id_prefix, KEY, pad(12)]
 
     exec.active_account::get_map_item
-    # => [VALUE]
+    # => [VALUE, pad(12)]
 end
 
-# Inputs: []
-# Outputs: [CURRENT_ROOT]
-pub proc get_current_map_root
-    # Getting the current root from the mapping slot.
+#! Returns the CURRENT_ROOT of the mapping.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [CURRENT_ROOT, pad(12)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_current_map_root() -> word
+    # get the current root from the mapping slot
     push.MAP_SLOT[0..2] exec.active_account::get_item
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(16)]
 
     exec.sys::truncate_stack
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(12)]
 end
 ```
 
@@ -95,7 +117,7 @@ end
 - **get_current_map_root:**  
   This procedure retrieves the current root of the mapping by calling `get_item` with the mapping slot ID and then truncating the stack to leave only the mapping root.
 
-**Security Note**: The procedure `write_to_map` calls the account procedure `incr_nonce`. This allows any external account to be able to write to the storage map of the account. Smart contract developers should know that procedures that call the `account::incr_nonce` procedure allow anyone to call the procedure and modify the state of the account.
+The Rust account below uses `NoAuth`, so anyone can import its public state and submit a mapping update without a signature. `NoAuth` handles fee payment and nonce changes; incrementing a nonce does not itself grant authorization. Use an appropriate authentication component when writes should be restricted.
 
 ### Transaction script that calls the smart contract
 
@@ -103,27 +125,42 @@ end
 use miden_by_example::mapping_example_contract
 use miden::core::sys
 
-begin
+#! Writes a mapping entry, reads it, and returns the current map root.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [CURRENT_ROOT, pad(12)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#! - CURRENT_ROOT is the mapping's Merkle root after the write.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word) -> word
+    dropw
+    # => [pad(16)]
+
     push.1.2.3.4
     push.0.0.0.0
-    # => [KEY, VALUE]
+    # => [KEY, VALUE, pad(16)]
 
     call.mapping_example_contract::write_to_map
-    # => []
+    # => [pad(24)]
 
     push.0.0.0.0
-    # => [KEY]
+    # => [KEY, pad(24)]
 
     call.mapping_example_contract::get_value_in_map
-    # => [VALUE]
+    # => [VALUE, pad(24)]
 
     dropw
-    # => []
+    # => [pad(24)]
 
     call.mapping_example_contract::get_current_map_root
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(20)]
 
     exec.sys::truncate_stack
+    # => [CURRENT_ROOT, pad(12)]
 end
 ```
 
@@ -131,7 +168,7 @@ end
 
 The transaction script does the following:
 
-- It pushes a key (`[0.0.0.0]`) and a value (`[1.2.3.4]`) onto the stack.
+- It pushes the value with `push.1.2.3.4`, then the key with `push.0.0.0.0`. The last pushed element is on top, so the stored value is `[4, 3, 2, 1]` and the key is `[0, 0, 0, 0]`.
 - It calls the `write_to_map` procedure, which is defined in the account’s smart contract. This updates the mapping in the account.
 - It then pushes the key again and calls `get_value_in_map` to retrieve the value associated with the key.
 - Finally, it calls `get_current_map_root` to get the current state (root) of the mapping.
@@ -142,32 +179,62 @@ The script calls the `write_to_map` procedure in the account which writes the ke
 
 ### Rust code that sets everything up
 
+From the parent directory of your `tutorials` clone, create a sibling Cargo project:
+
+```bash
+cargo new miden-mappings
+cd miden-mappings
+rustup override set 1.98.1
+cp ../tutorials/rust-client/Cargo.lock Cargo.lock
+```
+
+Add these dependencies and the development profile to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rust-client = { path = "../tutorials/rust-client" }
+miden-client = { version = "=0.16.0", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { version = "=0.16.0", package = "miden-client-sqlite-store" }
+miden-protocol = { version = "=0.16.0" }
+rand = { version = "0.10" }
+tokio = { version = "1.48", features = ["rt-multi-thread", "net", "macros", "fs"] }
+
+[profile.dev]
+opt-level = 2
+```
+
 Below is the Rust code that deploys the smart contract, creates the transaction script, and submits a transaction to update the mapping in the account:
 
 ```rust no_run
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
 
 use miden_client::{
+    ClientError,
     account::{
-        component::AccountComponentMetadata, AccountBuilder, AccountComponent,
-        AccountType, StorageMap, StorageSlot, StorageSlotName,
+        AccountBuilder, AccountComponent, AccountType, StorageMap, StorageMapKey, StorageSlot,
+        StorageSlotName,
+        component::{AccountComponentMetadata, BasicWallet},
     },
     auth::NoAuth,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient},
     transaction::TransactionRequestBuilder,
-    ClientError, Felt, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{FeeConfig, TutorialNetwork, fund_account_for_fees};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -179,29 +246,24 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Deploy a smart contract with a mapping
     // -------------------------------------------------------------------------
     println!("\n[STEP 1] Deploy a smart contract with a mapping");
 
-    // Load the MASM file for the counter contract. `include_str!` resolves at
-    // compile time relative to this source file.
-    let account_code = include_str!("../masm/accounts/mapping_example_contract.masm");
+    // Read the MASM source from the tutorials repository.
+    let account_code =
+        std::fs::read_to_string("../tutorials/masm/accounts/mapping_example_contract.masm")
+            .unwrap();
 
-    // Using an empty storage value in slot 0 since this is usually reserved
-    // for the account pub_key and metadata
-    let empty_slot_name =
-        StorageSlotName::new("miden::tutorials::mapping::value").expect("valid slot name");
-    let empty_storage_slot = StorageSlot::with_value(empty_slot_name.clone(), Word::default());
-
-    // initialize storage map
+    // Storage slots are named in v0.16; the component only needs its mapping slot.
     let storage_map = StorageMap::new();
     let map_slot_name =
         StorageSlotName::new("miden::tutorials::mapping::map").expect("valid slot name");
@@ -210,16 +272,16 @@ async fn main() -> Result<(), ClientError> {
     // Compile the account code into `AccountComponent` with one storage slot
     let component_code = client
         .code_builder()
-        .compile_component_code("miden_by_example::mapping_example_contract", account_code)
+        .compile_component_code("miden_by_example::mapping_example_contract", &account_code)
         .unwrap();
     let mapping_contract_component = AccountComponent::new(
         component_code,
-        vec![empty_storage_slot, storage_slot_map],
+        vec![storage_slot_map],
         AccountComponentMetadata::new("miden_by_example::mapping_example_contract"),
     )
     .unwrap();
 
-    // Init seed for the counter contract
+    // Init seed for the mapping contract
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
@@ -227,7 +289,8 @@ async fn main() -> Result<(), ClientError> {
     let mapping_example_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
         .with_component(mapping_contract_component.clone())
-        .with_auth_component(NoAuth)
+        .with_component(BasicWallet)
+        .with_component(NoAuth)
         .build()
         .unwrap();
 
@@ -235,21 +298,23 @@ async fn main() -> Result<(), ClientError> {
         .add_account(&mapping_example_contract, false)
         .await
         .unwrap();
+    fund_account_for_fees(&mut client, mapping_example_contract.id(), &fee_config).await?;
 
     // -------------------------------------------------------------------------
     // STEP 2: Call the Mapping Contract with a Script
     // -------------------------------------------------------------------------
     println!("\n[STEP 2] Call Mapping Contract With Script");
 
-    let script_code = include_str!("../masm/scripts/mapping_example_script.masm");
+    let script_code =
+        std::fs::read_to_string("../tutorials/masm/scripts/mapping_example_script.masm").unwrap();
 
     // Compile the transaction script with the account code linked as a
     // module on the same `CodeBuilder` chain.
     let tx_script = client
         .code_builder()
-        .with_linked_module("miden_by_example::mapping_example_contract", account_code)
+        .with_linked_module("miden_by_example::mapping_example_contract", &account_code)
         .unwrap()
-        .compile_tx_script(script_code)
+        .compile_tx_script(&script_code)
         .unwrap();
 
     // Build a transaction request with the custom script
@@ -260,12 +325,13 @@ async fn main() -> Result<(), ClientError> {
 
     // Execute and submit the transaction
     let tx_id = client
-        .submit_new_transaction(mapping_example_contract.id(), tx_increment_request)
+        .submit_tutorial_transaction(mapping_example_contract.id(), tx_increment_request)
         .await
         .unwrap();
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
@@ -276,18 +342,21 @@ async fn main() -> Result<(), ClientError> {
         .await
         .unwrap()
         .expect("mapping contract not found");
-    let key = [
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-        Felt::new_unchecked(0),
-    ]
-    .into();
+    let key = StorageMapKey::empty();
     println!(
         "Mapping state\n Index: {:?}\n Key: {:?}\n Value: {:?}",
         map_slot_name,
         key,
         account.storage().get_map_item(&map_slot_name, key)
+    );
+    let value = account.storage().get_map_item(&map_slot_name, key).unwrap();
+    assert_eq!(
+        value
+            .iter()
+            .map(|felt| felt.as_canonical_u64())
+            .collect::<Vec<_>>(),
+        vec![4, 3, 2, 1],
+        "the mapping must store the value written by the transaction script",
     );
 
     Ok(())
@@ -297,10 +366,10 @@ async fn main() -> Result<(), ClientError> {
 ### What the Rust code does
 
 - **Client Initialization:**  
-  The client is initialized with a connection to the Miden Testnet and a SQLite store. This sets up the environment to deploy and interact with accounts.
+  The client connects to Miden testnet and uses a SQLite store to track accounts, notes, and transactions.
 
 - **Deploying the Smart Contract:**  
-  The account containing the mapping is created by reading the MASM smart contract from a file, compiling it into an `AccountComponent`, and deploying it using an `AccountBuilder`.
+  The account MASM is compiled into an `AccountComponent` with a named map slot. `AccountBuilder` creates the account locally; consuming its native-asset funding note publishes it on-chain.
 
 - **Creating and Executing a Transaction Script:**  
   A separate MASM script is compiled into a `TransactionScript`. This script calls the smart contract's procedures to write to and then read from the mapping.
@@ -312,11 +381,13 @@ async fn main() -> Result<(), ClientError> {
 
 ### Running the example
 
-To run the full example, navigate to the `rust-client` directory in the [miden-tutorials](https://github.com/0xMiden/miden-tutorials/) repository and run this command:
+For the standalone Cargo project, save the Rust code as `src/main.rs` and run `TUTORIAL_NETWORK=testnet cargo run --release`.
+
+To run the checked-in example, return to the root of the [tutorials repository](https://github.com/0xMiden/tutorials/) and run:
 
 ```bash
 cd rust-client
-cargo run --release --bin mapping_example
+TUTORIAL_NETWORK=testnet cargo run --release --bin mapping_example
 ```
 
 This example shows how the script calls the procedure in the account, which then updates the mapping stored within the account. The mapping update is verified by reading the mapping’s key-value pair after the transaction completes.

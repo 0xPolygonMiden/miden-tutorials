@@ -1,7 +1,12 @@
 /**
- * Mint 100 MIDEN tokens on testnet to a fixed recipient.
+ * Mint 100 MID base units on the configured network to a newly created recipient.
+ * Uses testnet unless another network is configured explicitly.
  */
-import { MidenClient, NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import {
+  createTutorialClient,
+  fundAccountForFees,
+} from './feeSupport';
 
 export async function mintTestnetToAddress(): Promise<void> {
   if (typeof window === 'undefined') {
@@ -9,10 +14,8 @@ export async function mintTestnetToAddress(): Promise<void> {
     return;
   }
 
-  await MidenClient.ready();
-
-  const client = await MidenClient.create({
-    rpcUrl: 'https://rpc.testnet.miden.io',
+  const client = await createTutorialClient({
+    proverUrl: 'local',
   });
 
   console.log('Latest block:', (await client.sync()).blockNum());
@@ -27,22 +30,25 @@ export async function mintTestnetToAddress(): Promise<void> {
     storage: StorageMode.Public,
   });
   console.log('Faucet ID:', faucet.id().toString());
+  await fundAccountForFees(client, faucet);
 
   // ── Mint to recipient ───────────────────────────────────────────────────────
-  const recipientAddress = 'mtst1arpsz3jlmjxl7u2jjzfsc0wyqyaas6a9';
+  const recipient = await client.accounts.create({
+    storage: StorageMode.Public,
+  });
+  const recipientAddress = recipient.id().toString();
   console.log('Recipient address:', recipientAddress);
 
-  console.log('Minting 100 MIDEN tokens...');
+  console.log('Minting 100 MID base units...');
+  await client.sync();
   const { txId: mintTxId } = await client.transactions.mint({
     account: faucet,
-    to: recipientAddress,
+    to: recipient,
     amount: BigInt(100),
     type: NoteVisibility.Public,
   });
 
-  console.log('Waiting for settlement...');
-  await client.transactions.waitFor(mintTxId);
-
+  await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
   console.log('Mint tx id:', mintTxId.toHex());
   console.log('Mint complete.');
 }

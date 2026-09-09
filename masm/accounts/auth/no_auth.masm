@@ -1,6 +1,37 @@
 use miden::protocol::native_account
+use miden::standards::fee
 
+# CONSTANTS
+# =================================================================================================
+
+const POST_FEE_CYCLES = 1024
+
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Pays the native transaction fee and increments the account nonce without a signature.
+#!
+#! Inputs:  [AUTH_ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - AUTH_ARGS contains unused authentication arguments.
+#!
+#! Panics if:
+#! - the account cannot pay the transaction fee from its native asset balance.
+#!
+#! Invocation: call
 @auth_script
-pub proc auth__basic
+pub proc auth__basic(auth_args: word)
+    dropw
+    # => [pad(16)]
+
+    exec.fee::native_conversion_info
+    # => [CONVERSION_INFO, pad(16)]
+
+    push.POST_FEE_CYCLES exec.fee::pay_fee drop
+    # => [pad(16)]
+
     exec.native_account::incr_nonce drop
+    # => [pad(16)]
 end

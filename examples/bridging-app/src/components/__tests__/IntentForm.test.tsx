@@ -37,12 +37,8 @@ vi.mock('@miden-sdk/miden-wallet-adapter-react', () => ({
   }),
 }));
 vi.mock('@miden-sdk/miden-wallet-adapter-base', () => ({
-  // IntentForm constructs a `SendTransaction` only in the Confirm-&-sign flow,
-  // which these tests do not exercise. A minimal class stub keeps imports
-  // resolvable without dragging in the real WASM-backed SDK.
-  SendTransaction: class {
-    constructor(public sender: string, public recipient: string, public faucet: string, public note: string, public amount: number) {}
-  },
+  // These rendering tests do not submit the custom collateral transaction.
+  Transaction: { createCustomTransaction: vi.fn() },
 }));
 vi.mock('wagmi', () => ({
   useAccount: () => ({ address: undefined, isConnected: false }),

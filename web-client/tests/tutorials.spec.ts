@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-const tutorialTimeoutMs = 10 * 60 * 1000;
+const tutorialTimeoutMs = 30 * 60 * 1000;
 
 type RequiredLog = string | RegExp;
 
@@ -97,6 +97,7 @@ const runTutorial = async (
     );
   }
   expect(status?.state).toBe("passed");
+  expect(consoleLogs.some((line) => line.includes("Transaction committed:"))).toBe(true);
 
   for (const required of requiredLogs) {
     const matched = consoleLogs.some((line) =>

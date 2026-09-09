@@ -1,8 +1,19 @@
 use external_contract::counter_contract
 
-#! Inputs:  []
-#! Outputs: []
+#! Increments the network counter when this note is consumed.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused note script arguments.
+#!
+#! Invocation: dyncall
 @note_script
-pub proc main
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
     call.counter_contract::increment_count
+    # => [pad(16)]
 end

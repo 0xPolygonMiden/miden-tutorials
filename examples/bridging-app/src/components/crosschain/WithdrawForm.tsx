@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SelectContent, SelectItem, SelectRoot, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { MIDEN_USDC_FAUCET_ID } from '@/config';
 
 // EVM-side token decimals + the Miden-side faucet account ID for each known
 // token. The Epoch test ERC-20s on Sepolia are 18-decimal (verified on-chain);
@@ -27,7 +28,7 @@ const SEPOLIA_TOKENS: ReadonlyArray<{
     symbol: 'USDC',
     address: '0x2BB4FfD7E2c6D432b697554Efd77fA13bdbefd69',
     decimals: 18,
-    midenFaucetId: '0x0a7d175ed63ec5200fb2ced86f6aa5',
+    midenFaucetId: MIDEN_USDC_FAUCET_ID,
   },
   { symbol: 'USDT', address: '0xc04d2869665Be874881133943523723Be5782720', decimals: 18 },
   { symbol: 'Custom', address: '', decimals: 18 },

@@ -1,28 +1,30 @@
+use rust_client::TutorialClientExt;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use miden_client::{
     account::{
-        component::{AccountComponentMetadata, AuthNetworkAccount, BasicWallet}, AccountBuilder, AccountComponent,
-        AccountType, StorageSlot, StorageSlotName,
+        component::{
+            AccountComponentMetadata, AuthNetworkAccount, BasicConstantFeePolicy, BasicWallet,
+            FeePolicy, FeePolicyManager,
+        },
+        AccountBuilder, AccountComponent, AccountType, StorageSlot, StorageSlotName,
     },
-    address::NetworkId,
-    auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
+    asset::AssetAmount,
+    auth::{AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,
     crypto::FeltRng,
     keystore::{FilesystemKeyStore, Keystore},
     note::{
         NetworkAccountTarget, Note, NoteAssets, NoteAttachments, NoteError, NoteExecutionHint,
-        NoteRecipient, NoteStorage, NoteTag, NoteType, PartialNoteMetadata,
+        NoteRecipient, NoteStorage, NoteTag, NoteType, P2idNote, PartialNoteMetadata,
     },
-    rpc::{Endpoint, GrpcClient},
-    store::TransactionFilter,
-    transaction::{
-        TransactionId, TransactionRequestBuilder, TransactionStatus,
-    },
+    rpc::{GrpcClient, VerifyingRpcClient},
+    transaction::{ExpirationTransactionScript, TransactionId, TransactionRequestBuilder},
     Client, ClientError, Felt, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use rand::RngCore;
+use rand::Rng;
+use rust_client::{fund_account_for_fees, FeeConfig, TutorialNetwork};
 use tokio::time::{sleep, Duration};
 
 /// Waits for a specific transaction to be committed.
@@ -30,39 +32,18 @@ async fn wait_for_tx(
     client: &mut Client<FilesystemKeyStore>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
+    rust_client::wait_for_transaction(client, tx_id).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -74,12 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
+    let fee_faucet_id = fee_config.native_fee_faucet_id();
 
     // -------------------------------------------------------------------------
     // STEP 1: Create Basic User Account
@@ -95,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the account
     let alice_account = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(AuthSingleSig::from_public_key(key_pair.public_key()))
         .with_component(BasicWallet)
         .build()
         .unwrap();
@@ -104,11 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.add_account(&alice_account, false).await?;
 
     // Add the key pair to the keystore
-    keystore.add_key(&key_pair, alice_account.id()).await.unwrap();
+    keystore
+        .add_key(&key_pair, alice_account.id())
+        .await
+        .unwrap();
+    fund_account_for_fees(&mut client, alice_account.id(), &fee_config).await?;
 
     println!(
         "Alice's account ID: {:?}",
-        alice_account.id().to_bech32(NetworkId::Testnet)
+        alice_account.id().to_bech32(network.network_id())
     );
 
     // -------------------------------------------------------------------------
@@ -119,34 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `include_str!` resolves at compile time relative to this source file,
     // so the binary is independent of the working directory it is run from.
     let counter_code = include_str!("../../../masm/accounts/counter.masm");
-    let script_code = include_str!("../../../masm/scripts/counter_script.masm");
     let network_note_code = include_str!("../../../masm/notes/network_increment_note.masm");
 
-    // In protocol v0.15 an account is a *network account* (one the network
+    // An account is a *network account* (one the network
     // transaction builder executes on a user's behalf) if and only if it is
     // public AND carries the `AuthNetworkAccount` auth component. That component
-    // holds two allowlists, both fixed at account creation:
-    //   * the note-script allowlist: its presence is what marks the account as a
-    //     network account, and the builder only executes notes whose script root
-    //     is listed here;
-    //   * the tx-script allowlist: the network auth procedure rejects any custom
-    //     tx script whose root is not listed, so the STEP 3 deploy script must be
-    //     in it.
-    // We therefore compile the note script and the deploy tx script now and feed
-    // their MAST roots into the allowlists below. Both compiled scripts are reused
-    // as-is in STEP 3 (tx script) and STEP 4 (note script) — nothing is compiled
-    // twice.
+    // holds an allowlist of note scripts the network builder may execute.
+    // Compile the increment note first so its root can be included at creation.
     let note_script = client
         .code_builder()
         .with_linked_module("external_contract::counter_contract", counter_code)?
         .compile_note_script(network_note_code)?;
     let note_script_root = note_script.root();
-
-    let tx_script = client
-        .code_builder()
-        .with_linked_module("external_contract::counter_contract", counter_code)?
-        .compile_tx_script(script_code)?;
-    let tx_script_root = tx_script.root();
 
     // Compile the counter MASM into an account component
     let counter_slot_name =
@@ -167,49 +137,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    // Build the network account: public + `AuthNetworkAccount` with the note-script
-    // root allowlisted (this is what makes it a network account) and the deploy
-    // tx-script root allowlisted (so the auth procedure accepts the STEP 3 deploy).
-    let network_auth = AuthNetworkAccount::with_allowed_notes(BTreeSet::from([note_script_root]))?
-        .with_allowed_tx_scripts(BTreeSet::from([tx_script_root]));
+    // Build the public network account with the increment and funding notes allowed.
+    let fee_policy: FeePolicy = BasicConstantFeePolicy::new()
+        .with_fees(
+            [note_script_root, P2idNote::script_root()].map(|root| (root, AssetAmount::ZERO)),
+        )
+        .into();
+    let fee_policy_manager = FeePolicyManager::builder()
+        .fee_faucet_id(fee_faucet_id)
+        .active_fee_policy(fee_policy)
+        .build();
+    // Match the protocol/node counter example: only permit the two note scripts
+    // this account implements. Config notes need Authority, which it does not have.
+    // The canonical expiration script is required by the network builder.
+    let network_auth = AuthNetworkAccount::custom(
+        BTreeSet::from([note_script_root, P2idNote::script_root()]),
+        fee_policy_manager,
+    )?
+    .with_allowed_tx_scripts([ExpirationTransactionScript::script_root()]);
     let counter_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(network_auth)
+        .with_components(network_auth)
         .with_component(counter_component)
+        .with_component(BasicWallet)
         .build()
         .unwrap();
 
     client.add_account(&counter_contract, false).await.unwrap();
+    fund_account_for_fees(&mut client, counter_contract.id(), &fee_config).await?;
 
     println!(
         "contract id: {:?}",
-        counter_contract.id().to_bech32(NetworkId::Testnet)
+        counter_contract.id().to_bech32(network.network_id())
     );
 
     // -------------------------------------------------------------------------
-    // STEP 3: Deploy Network Account with Transaction Script
+    // STEP 3: Publish the network account
     // -------------------------------------------------------------------------
     println!("\n[STEP 3] Deploy network counter smart contract");
 
-    // Reuse the `tx_script` compiled in STEP 2 (its root is allowlisted on the
-    // account, so the network auth procedure accepts this deploy transaction).
-    let tx_increment_request = TransactionRequestBuilder::new()
-        .custom_script(tx_script)
-        .build()
-        .unwrap();
-
-    let tx_id = client
-        .submit_new_transaction(counter_contract.id(), tx_increment_request)
-        .await
-        .unwrap();
-
-    println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
-        tx_id
-    );
-
-    // Wait for the transaction to be committed
-    wait_for_tx(&mut client, tx_id).await.unwrap();
+    // On a fee-enabled network, consuming the funding note already published this
+    // account. RPC permits users to deploy new network accounts, but rejects
+    // user-submitted transactions for existing ones. Subsequent increments must
+    // be requested by notes and executed by the network transaction builder.
+    if !fee_config.fees_are_active() {
+        let deployment = TransactionRequestBuilder::new().build()?;
+        client
+            .submit_tutorial_transaction(counter_contract.id(), deployment)
+            .await?;
+    }
+    println!("Network counter deployed; initial count is 0");
 
     // -------------------------------------------------------------------------
     // STEP 4: Prepare & Create the Network Note
@@ -244,11 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let note_tx_id = client
-        .submit_new_transaction(alice_account.id(), note_req)
+        .submit_tutorial_transaction(alice_account.id(), note_req)
         .await?;
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         note_tx_id
     );
 
@@ -263,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sleep(Duration::from_secs(6)).await;
 
     let mut last_val = None;
-    for _ in 0..10 {
+    for _ in 0..24 {
         client.sync_state().await?;
 
         // Checking updated state
@@ -276,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap()
                 .into();
             let val = count[0].as_canonical_u64();
-            if val >= 2 {
+            if val == 1 {
                 println!("🔢 Final counter value: {}", val);
                 return Ok(());
             }
@@ -288,12 +266,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The network note was submitted, but it is executed asynchronously by the
-    // network transaction builder. If the counter has not reached 2 within the
+    // network transaction builder. If the counter has not reached 1 within the
     // polling window, the tutorial's final state is unconfirmed, so fail rather
     // than claim success.
     if let Some(val) = last_val {
         Err(format!(
-            "Counter did not reach the expected value 2 within the timeout (last observed {}). \
+            "Counter did not reach the expected value 1 within the timeout (last observed {}). \
              The network note was submitted but its execution is still pending on the network \
              transaction builder; re-run or check Midenscan.",
             val

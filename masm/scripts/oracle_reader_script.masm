@@ -1,5 +1,19 @@
 use external_contract::oracle_reader
 
-begin
-    exec.oracle_reader::get_price
+#! Queries the configured oracle through the reader account.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused transaction script arguments.
+#!
+#! Invocation: dyncall
+@transaction_script
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
+    call.oracle_reader::get_price
+    # => [pad(16)]
 end

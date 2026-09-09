@@ -10,7 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RainbowKitProvider, lightTheme } from "@rainbow-me/rainbowkit";
 import "@rainbow-me/rainbowkit/styles.css";
 import { Toaster } from "sonner";
-import { APP_NAME, MIDEN_RPC_URL, MIDEN_PROVER } from "@/config";
+import { APP_NAME, MIDEN_NETWORK, MIDEN_RPC_URL, MIDEN_PROVER } from "@/config";
 import { wagmiConfig } from "@/config/wagmi";
 
 // Provider chain for the bridging-app:
@@ -43,7 +43,8 @@ export function AppProviders({ children }: { children: ReactNode }) {
         <RainbowKitProvider theme={rkTheme}>
           <MidenFiSignerProvider
             appName={APP_NAME}
-            network={WalletAdapterNetwork.Testnet}
+            network={MIDEN_NETWORK === "local" ? WalletAdapterNetwork.Localnet :
+              MIDEN_NETWORK === "devnet" ? WalletAdapterNetwork.Devnet : WalletAdapterNetwork.Testnet}
             allowedPrivateData={AllowedPrivateData.Assets}
             autoConnect
           >

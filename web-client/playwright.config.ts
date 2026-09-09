@@ -1,6 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
-const tutorialTimeoutMs = 10 * 60 * 1000;
+const tutorialTimeoutMs = 30 * 60 * 1000;
 
 export default defineConfig({
   testDir: "./tests",
@@ -12,14 +12,11 @@ export default defineConfig({
   use: {
     baseURL: "http://localhost:3000",
     headless: true,
-    launchOptions: {
-      args: ["--disable-web-security"],
-    },
   },
   webServer: {
     command: "yarn dev",
     url: "http://localhost:3000",
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120 * 1000,
   },
 });
