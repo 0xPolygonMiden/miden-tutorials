@@ -7,6 +7,15 @@ import { CodeSdkTabs } from '@site/src/components';
 
 _Using the Miden client in TypeScript to mint, consume, and transfer assets_
 
+:::note v0.16 setup
+
+Follow the [network and fee setup](./setup_guide.md#network-and-fee-setup)
+and copy the shared support files imported by the complete example.
+For React snippets, initialize `authScheme` with `await tutorialAuthScheme()`
+as shown in the complete example.
+
+:::
+
 ## Overview
 
 In the previous tutorial, we set up the foundation - creating Alice's wallet and deploying a faucet. Now we'll put these to use by minting and transferring assets.
@@ -102,8 +111,9 @@ _The standard asset transfer note on Miden is the P2ID note (Pay-to-Id). There i
 Now that Alice has tokens in her account, she can send some to Bob:
 
 <CodeSdkTabs example={{
-react: { code: `// 7. Send 100 tokens to Bob
-const bobAddress = 'mtst1arpsz3jlmjxl7u2jjzfsc0wyqyaas6a9';
+react: { code: `// 7. Create Bob and send him 100 tokens
+const bob = await createWallet({ storageMode: StorageMode.Public, authScheme });
+const bobAddress = bob.id().toString();
 console.log("Sending tokens to Bob's account...");
 await send({
 .from: alice,
@@ -113,8 +123,11 @@ await send({
 .noteType: NoteVisibility.Public,
 });
 console.log('Tokens sent successfully!');` },
-typescript: { code: `// 7. Send tokens to Bob
-const bobAddress = 'mtst1arpsz3jlmjxl7u2jjzfsc0wyqyaas6a9';
+typescript: { code: `// 7. Create Bob and send him tokens
+const bob = await client.accounts.create({
+.storage: StorageMode.Public,
+});
+const bobAddress = bob.id().toString();
 console.log("Sending tokens to Bob's account...");
 
 await client.transactions.send({
@@ -143,89 +156,123 @@ Here's the complete `lib/react/createMintConsume.tsx` (React) or `lib/createMint
 <CodeSdkTabs example={{
 react: { code: `'use client';
 
-import { MidenProvider, useMiden, useCreateWallet, useCreateFaucet, useMint, useConsume, useSend, useWaitForCommit, useWaitForNotes } from '@miden-sdk/react/lazy';
+import {
+.MidenProvider,
+.useMiden,
+.useCreateWallet,
+.useCreateFaucet,
+.useMint,
+.useConsume,
+.useSend,
+} from '@miden-sdk/react/lazy';
 import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import { tutorialNetwork } from '../feeSupport';
+import {
+.TutorialButton,
+.tutorialAuthScheme,
+.useTutorialSupport,
+} from './tutorialSupport';
 
 function CreateMintConsumeInner() {
-.const { isReady } = useMiden();
+.const { sync } = useMiden();
 .const { createWallet } = useCreateWallet();
 .const { createFaucet } = useCreateFaucet();
 .const { mint } = useMint();
 .const { consume } = useConsume();
 .const { send } = useSend();
-.const { waitForCommit } = useWaitForCommit();
-.const { waitForConsumableNotes } = useWaitForNotes();
+.const {
+..fundAccount,
+..committed,
+..waitForTokenNotes,
+..waitForNote,
+..assertBalance,
+.} = useTutorialSupport();
 
 .const run = async () => {
-..// 1. Create Alice's wallet (public, mutable)
-..console.log('Creating account for Alice…');
-..const alice = await createWallet({ storageMode: StorageMode.Public });
-..const aliceId = alice.id().toString();
-..console.log('Alice ID:', aliceId);
+..console.log('Synchronizing before creating accounts…');
+..await sync();
+..console.log('Creating Alice with useCreateWallet…');
+..const authScheme = await tutorialAuthScheme();
+..// Native fee tokens and the tutorial's MID token are separate assets.
+..const alice = await createWallet({
+...storageMode: StorageMode.Public,
+...authScheme,
+..});
+..console.log('Alice ID:', alice.id().toString());
+..await fundAccount(alice);
 
-..// 2. Deploy a fungible faucet
-..console.log('Creating faucet…');
+..// v0.16 faucets include BasicWallet, so they can receive fee funding.
 ..const faucet = await createFaucet({
 ...tokenSymbol: 'MID',
 ...decimals: 8,
 ...maxSupply: BigInt(1_000_000),
 ...storageMode: StorageMode.Public,
+...authScheme,
 ..});
-..const faucetId = faucet.id().toString();
-..console.log('Faucet ID:', faucetId);
+..console.log('Faucet ID:', faucet.id().toString());
+..await fundAccount(faucet);
 
-..// 3. Mint 1000 tokens to Alice
-..console.log('Minting tokens to Alice...');
-..const mintResult = await mint({
-...faucetId,
-...targetAccountId: aliceId,
+..await sync();
+..const minted = await mint({
+...faucetId: faucet,
+...targetAccountId: alice,
 ...amount: BigInt(1000),
 ...noteType: NoteVisibility.Public,
 ..});
-..console.log('Mint tx:', mintResult.transactionId);
+..await committed(minted.transactionId);
+..const notes = await waitForTokenNotes(alice, faucet);
+..const consumed = await consume({ accountId: alice.id().toString(), notes });
+..await committed(consumed.transactionId);
+..await assertBalance(alice, faucet, BigInt(1000));
 
-..// 4. Wait for the mint transaction to be committed
-..await waitForCommit(mintResult.transactionId);
-
-..// 5. Wait for consumable notes to appear, then consume them
-..const notes = await waitForConsumableNotes({ accountId: alice });
-..console.log('Consumable notes:', notes.length);
-
-..console.log('Consuming minted notes...');
-..await consume({ accountId: alice.id().toString(), notes });
-..console.log('Notes consumed.');
-
-..// 7. Send 100 tokens to Bob
-..const bobAddress = 'mtst1arpsz3jlmjxl7u2jjzfsc0wyqyaas6a9';
-..console.log("Sending tokens to Bob's account...");
-..await send({
+..const bob = await createWallet({
+...storageMode: StorageMode.Public,
+...authScheme,
+..});
+..const sent = await send({
 ...from: alice,
-...to: bobAddress,
+...to: bob,
 ...assetId: faucet,
 ...amount: BigInt(100),
 ...noteType: NoteVisibility.Public,
+...returnNote: true,
 ..});
+..await committed(sent.txId);
+..if (!sent.note) throw new Error('Send did not return its output note');
+..await waitForNote(sent.note.id().toString());
+..await assertBalance(alice, faucet, BigInt(900));
 ..console.log('Tokens sent successfully!');
 .};
 
 .return (
-..<div>
-...<button onClick={run} disabled={!isReady}>
-....{isReady ? 'Run: Create, Mint, Consume & Send' : 'Initializing…'}
-...</button>
-..</div>
+..<TutorialButton
+...name="createMintConsume"
+...label="Run: Create, Mint, Consume & Send"
+...run={run}
+../>
 .);
 }
 
 export default function CreateMintConsume() {
 .return (
-..<MidenProvider config={{ rpcUrl: 'testnet', prover: 'local' }}>
+..<MidenProvider
+...config={{
+....rpcUrl: tutorialNetwork(),
+....prover: 'local',
+....autoSyncInterval: 0,
+...}}
+..>
 ...<CreateMintConsumeInner />
 ..</MidenProvider>
 .);
 }`},
-  typescript: { code:`// lib/createMintConsume.ts
-import { MidenClient, NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+  typescript: { code: `// lib/createMintConsume.ts
+import { NoteVisibility, StorageMode } from '@miden-sdk/miden-sdk/lazy';
+import {
+.consumeAllFeeAware,
+.createTutorialClient,
+.fundAccountForFees,
+} from './feeSupport';
 
 export async function createMintConsume(): Promise<void> {
 .if (typeof window === 'undefined') {
@@ -233,11 +280,8 @@ export async function createMintConsume(): Promise<void> {
 ..return;
 .}
 
-.// Wait for WASM to be ready before touching any wasm-bindgen type.
-.await MidenClient.ready();
-
-.const client = await MidenClient.create({
-..rpcUrl: 'https://rpc.testnet.miden.io',
+.const client = await createTutorialClient({
+..proverUrl: 'local',
 .});
 
 .// 1. Sync with the latest blockchain state
@@ -251,7 +295,8 @@ export async function createMintConsume(): Promise<void> {
 .});
 .console.log('Alice ID:', alice.id().toString());
 
-.// 3. Deploy a fungible faucet
+.// 3. Create our own fungible faucet. SDK v0.16 includes BasicWallet,
+.// allowing both accounts to consume native fee funding before minting MID.
 .console.log('Creating faucet…');
 .const faucet = await client.accounts.create({
 ..type: 0, // 0 = FungibleFaucet
@@ -261,38 +306,47 @@ export async function createMintConsume(): Promise<void> {
 ..storage: StorageMode.Public,
 .});
 .console.log('Faucet ID:', faucet.id().toString());
+.await fundAccountForFees(client, alice);
+.await fundAccountForFees(client, faucet);
 
-.// 4. Mint tokens to Alice
-
+.// 4. Mint tokens to Alice.
 .console.log('Minting tokens to Alice...');
+.await client.sync();
 .const { txId: mintTxId } = await client.transactions.mint({
 ..account: faucet,
 ..to: alice,
 ..amount: BigInt(1000),
 ..type: NoteVisibility.Public,
 .});
-
 .console.log('Waiting for transaction confirmation...');
-.await client.transactions.waitFor(mintTxId);
+.await client.transactions.waitFor(mintTxId, { timeout: 120_000 });
 
-.// 5-6. Consume all available notes for Alice in a single transaction
+.// 5-6. Consume all available notes for Alice.
 .console.log('Consuming minted notes...');
-.await client.transactions.consumeAll({
-..account: alice,
-.});
+.await consumeAllFeeAware(client, alice);
 
 .console.log('Notes consumed.');
 
 .// 7. Send tokens to Bob
-.const bobAddress = 'mtst1arpsz3jlmjxl7u2jjzfsc0wyqyaas6a9';
+.const bob = await client.accounts.create({
+..storage: StorageMode.Public,
+.});
 .console.log("Sending tokens to Bob's account...");
-.await client.transactions.send({
+.await client.sync();
+.const { txId: sendTxId } = await client.transactions.send({
 ..account: alice,
-..to: bobAddress,
+..to: bob,
 ..token: faucet,
 ..amount: BigInt(100),
 ..type: NoteVisibility.Public,
+..waitForConfirmation: true,
+..timeout: 120_000,
 .});
+.console.log(\`Transaction committed: \${sendTxId.toHex()}\`);
+.const updatedAlice = await client.accounts.get(alice);
+.const balance = updatedAlice?.vault().getBalance(faucet.id());
+.if (balance !== BigInt(900))
+..throw new Error(\`Expected Alice to retain 900 MID, got \${balance}\`);
 .console.log('Tokens sent successfully!');
 }` },
 }} reactFilename="lib/react/createMintConsume.tsx" tsFilename="lib/createMintConsume.ts" />

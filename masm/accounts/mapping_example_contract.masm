@@ -1,43 +1,64 @@
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+use {StorageMapKey} from miden::protocol::types
+
+# CONSTANTS
+# =================================================================================================
 
 const MAP_SLOT = word("miden::tutorials::mapping::map")
 
-# Inputs: [KEY, VALUE]
-# Outputs: []
-pub proc write_to_map
-    # The storage map is in the mapping slot.
-    push.MAP_SLOT[0..2]
-    # => [slot_id_prefix, slot_id_suffix, KEY, VALUE]
+# PUBLIC INTERFACE
+# =================================================================================================
 
-    # Setting the key value pair in the map
+#! Stores VALUE under KEY in the mapping.
+#!
+#! Inputs:  [KEY, VALUE, pad(8)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc write_to_map(key: StorageMapKey, value: word)
+    # the storage map is in the mapping slot
+    push.MAP_SLOT[0..2]
+    # => [slot_id_suffix, slot_id_prefix, KEY, VALUE, pad(8)]
+
+    # set the key-value pair in the map
     exec.native_account::set_map_item
-    # => [OLD_VALUE]
+    # => [OLD_VALUE, pad(12)]
 
     dropw
-    # => []
+    # => [pad(16)]
 end
 
-# Inputs: [KEY]
-# Outputs: [VALUE]
-pub proc get_value_in_map
-    # The storage map is in the mapping slot.
+#! Returns the VALUE stored under KEY in the mapping.
+#!
+#! Inputs:  [KEY, pad(12)]
+#! Outputs: [VALUE, pad(12)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_value_in_map(key: StorageMapKey) -> word
+    # the storage map is in the mapping slot
     push.MAP_SLOT[0..2]
-    # => [slot_id_prefix, slot_id_suffix, KEY]
+    # => [slot_id_suffix, slot_id_prefix, KEY, pad(12)]
 
     exec.active_account::get_map_item
-    # => [VALUE]
+    # => [VALUE, pad(12)]
 end
 
-# Inputs: []
-# Outputs: [CURRENT_ROOT]
-pub proc get_current_map_root
-    # Getting the current root from the mapping slot.
+#! Returns the CURRENT_ROOT of the mapping.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [CURRENT_ROOT, pad(12)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_current_map_root() -> word
+    # get the current root from the mapping slot
     push.MAP_SLOT[0..2] exec.active_account::get_item
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(16)]
 
     exec.sys::truncate_stack
-    # => [CURRENT_ROOT]
+    # => [CURRENT_ROOT, pad(12)]
 end

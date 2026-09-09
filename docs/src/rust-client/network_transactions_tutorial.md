@@ -7,17 +7,21 @@ sidebar_position: 6
 
 _Using the Miden client in Rust to deploy and interact with smart contracts using network transactions_
 
+For toolchain requirements and shared fee helpers, see the [Rust client setup](./index.md#running-the-v016-examples).
+
 ## Overview
 
 In this tutorial, we will explore Network Transactions (NTXs) on Miden - a powerful feature that enables autonomous smart contract execution and public shared state management. Unlike local transactions that require users to execute and prove, network transactions are executed and proven by a network transaction builder.
 
-We'll build a network counter smart contract using the same MASM code as the regular counter. In v0.15 there is no separate network storage mode. Instead, an account is a _network account_ — one the network transaction builder executes on a user's behalf — if and only if it is public (`AccountType::Public`) **and** carries the `AuthNetworkAccount` auth component with a non-empty note-script allowlist. The allowed note-script roots and transaction-script roots are pinned at account creation. Attaching a `NetworkAccountTarget` to a note is necessary but not sufficient: without the allowlist the node never classifies the account as a network account, and the note is silently orphaned. See the [account changes migration guide](https://docs.miden.xyz/builder/migration/account-changes).
+We'll build a public network counter using the same MASM code as the regular counter. `AuthNetworkAccount` configures the note scripts that the network transaction builder may execute, and a fee policy prices those notes. The increment note also carries a `NetworkAccountTarget` attachment identifying its target. See the [account changes migration guide](https://docs.miden.xyz/builder/migration/account-changes).
+
+Deployment and subsequent updates are different operations. On a fee-enabled network, consuming the initial native-asset funding note publishes the new network account with count **0**. After publication, the public RPC rejects user-submitted transactions that directly update an existing network account. Alice must publish an increment note from her own account; the network transaction builder consumes it and changes the counter to **1**. This restriction is enforced by the [node's submission handler](https://github.com/0xMiden/node/blob/v0.16.0/crates/rpc/src/server/api/submit_proven_tx.rs#L94).
 
 ## What we'll cover
 
 - Understanding Network Transactions and when to use them
 - Deploying public smart contracts that the network operator can execute
-- Using transaction scripts to initialize network contracts on-chain
+- Publishing a new network account through its initial funding transaction
 - Creating network notes for user interactions
 - Validating network transaction results
 
@@ -29,108 +33,134 @@ This tutorial assumes you have completed the [counter contract tutorial](counter
 
 Network transactions are executed and proven by the Miden operator rather than the client. They are useful for:
 
-- **Public shared state**: Multiple users can interact with the same contract state without race conditions
+- **Public shared state**: Multiple users can publish notes targeting the same contract; the network transaction builder orders their execution
 - **Autonomous execution**: Smart contracts can execute when conditions are met without user intervention
 - **Resource-constrained devices**: Clients that can't generate ZK proofs efficiently
 - **AMM applications**: Using network notes, you can build sophisticated AMMs where trades execute automatically
 
-The main trade-off is reduced privacy since the operator can see transaction inputs.
+The account state and increment notes in this example are public, so the operator can see the transaction inputs.
 
 ## Step 1: Initialize your repository
 
-Create a new Rust repository for your Miden project and navigate to it:
+From the parent directory of your `tutorials` clone, create a sibling Cargo project:
 
 ```bash
 cargo new miden-network-transactions
 cd miden-network-transactions
+rustup override set 1.98.1
+cp ../tutorials/rust-client/Cargo.lock Cargo.lock
 ```
 
 Add the following dependencies to your `Cargo.toml` file:
 
 ```toml
 [dependencies]
-miden-client = { version = "0.15", features = ["testing", "tonic"] }
-miden-client-sqlite-store = { version = "0.15", package = "miden-client-sqlite-store" }
-miden-protocol = { version = "0.15" }
-rand = { version = "0.9" }
-tokio = { version = "1.46", features = ["rt-multi-thread", "net", "macros", "fs"] }
+# Clone tutorials next to this Cargo project (see Rust client setup).
+rust-client = { path = "../tutorials/rust-client" }
+miden-client = { version = "=0.16.0", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { version = "=0.16.0", package = "miden-client-sqlite-store" }
+miden-protocol = { version = "=0.16.0" }
+rand = { version = "0.10" }
+tokio = { version = "1.48", features = ["rt-multi-thread", "net", "macros", "fs"] }
+
+[profile.dev]
+opt-level = 2
 ```
 
 ## Step 2: Set up MASM files
 
-Create the directory structure:
-
-```bash
-mkdir -p masm/accounts masm/scripts masm/notes
-```
+The example reads the counter and note sources from the repository’s `masm/` directory.
 
 ### Counter Contract
 
 We'll use the same counter contract MASM code as the regular counter tutorial. The key difference is in the Rust configuration, not the MASM code.
 
-Create `masm/accounts/counter.masm`:
+The counter is defined in `masm/accounts/counter.masm`:
 
 ```masm
 use miden::protocol::active_account
 use miden::protocol::native_account
-use miden::core::word
 use miden::core::sys
+
+# CONSTANTS
+# =================================================================================================
 
 const COUNTER_SLOT = word("miden::tutorials::counter")
 
-#! Inputs:  []
-#! Outputs: [count]
-pub proc get_count
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Returns the current count.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [count, pad(15)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc get_count() -> felt
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     exec.sys::truncate_stack
-    # => [count]
+    # => [count, pad(15)]
 end
 
-#! Inputs:  []
-#! Outputs: []
-pub proc increment_count
+#! Increments the current count by one.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+@account_procedure
+pub proc increment_count()
     push.COUNTER_SLOT[0..2] exec.active_account::get_item
-    # => [count]
+    # => [[count, 0, 0, 0], pad(16)]
 
     add.1
-    # => [count+1]
+    # => [[count + 1, 0, 0, 0], pad(16)]
 
     push.COUNTER_SLOT[0..2] exec.native_account::set_item
-    # => []
+    # => [OLD_VALUE, pad(16)]
+
+    dropw
+    # => [pad(16)]
 
     exec.sys::truncate_stack
-    # => []
+    # => [pad(16)]
 end
 ```
 
-### Transaction Script for Deployment
+### Initial deployment
 
-Create `masm/scripts/counter_script.masm`:
-
-```masm
-use external_contract::counter_contract
-
-begin
-    call.counter_contract::increment_count
-end
-```
-
-This script executes a function call (increment) that creates a necessary state change for our contract to be deployed and stored on the network on-chain. In Miden, public contracts must have their state modified through a transaction to be properly registered and committed to the blockchain - simply creating the account isn't sufficient.
+Creating an account locally does not publish it. The funding helper below creates
+the new account's first committed transaction by consuming its native-asset note.
+No separate increment transaction script is needed on a fee-enabled network. The
+empty deployment request shown later is only for networks with zero fees, where
+funding does not perform that initial transaction.
 
 ### Network Note for User Interaction
 
-Create `masm/notes/network_increment_note.masm`. Note scripts are compiled as libraries; the `@note_script` attribute marks the entrypoint procedure.
+The increment note is defined in `masm/notes/network_increment_note.masm`. Note scripts are compiled as libraries; the `@note_script` attribute marks the entrypoint procedure.
 
 ```masm
 use external_contract::counter_contract
 
-#! Inputs:  []
-#! Outputs: []
+#! Increments the network counter when this note is consumed.
+#!
+#! Inputs:  [ARGS, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - ARGS contains unused note script arguments.
+#!
+#! Invocation: dyncall
 @note_script
-pub proc main
+pub proc main(args: word)
+    dropw
+    # => [pad(16)]
+
     call.counter_contract::increment_count
+    # => [pad(16)]
 end
 ```
 
@@ -143,69 +173,52 @@ Before deploying the network account and creating network notes, we need to set 
 Copy and paste the following code into your `src/main.rs` file:
 
 ```rust no_run
+use rust_client::TutorialClientExt;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use miden_client::{
+    Client, ClientError, Felt, Word,
     account::{
-        component::{AccountComponentMetadata, AuthNetworkAccount, BasicWallet}, AccountBuilder, AccountComponent,
-        AccountType, StorageSlot, StorageSlotName,
+        AccountBuilder, AccountComponent, AccountType, StorageSlot, StorageSlotName,
+        component::{
+            AccountComponentMetadata, AuthNetworkAccount, BasicConstantFeePolicy, BasicWallet,
+            FeePolicy, FeePolicyManager,
+        },
     },
-    address::NetworkId,
-    auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
+    asset::AssetAmount,
+    auth::{AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,
     crypto::FeltRng,
     keystore::{FilesystemKeyStore, Keystore},
     note::{
         NetworkAccountTarget, Note, NoteAssets, NoteAttachments, NoteError, NoteExecutionHint,
-        NoteRecipient, NoteStorage, NoteTag, NoteType, PartialNoteMetadata,
+        NoteRecipient, NoteStorage, NoteTag, NoteType, P2idNote, PartialNoteMetadata,
     },
-    rpc::{Endpoint, GrpcClient},
-    store::TransactionFilter,
-    transaction::{TransactionId, TransactionRequestBuilder, TransactionStatus},
-    Client, ClientError, Felt, Word,
+    rpc::{GrpcClient, VerifyingRpcClient},
+    transaction::{ExpirationTransactionScript, TransactionId, TransactionRequestBuilder},
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use rand::RngCore;
-use tokio::time::{sleep, Duration};
+use rand::Rng;
+use rust_client::{FeeConfig, TutorialNetwork, fund_account_for_fees};
+use tokio::time::{Duration, sleep};
 
 /// Waits for a specific transaction to be committed.
 async fn wait_for_tx(
     client: &mut Client<FilesystemKeyStore>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
+    rust_client::wait_for_transaction(client, tx_id).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -217,12 +230,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
+    let fee_faucet_id = fee_config.native_fee_faucet_id();
 
     // -------------------------------------------------------------------------
     // STEP 1: Create Basic User Account
@@ -238,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the account
     let alice_account = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(AuthSingleSig::from_public_key(key_pair.public_key()))
         .with_component(BasicWallet)
         .build()
         .unwrap();
@@ -247,11 +261,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.add_account(&alice_account, false).await?;
 
     // Add the key pair to the keystore
-    keystore.add_key(&key_pair, alice_account.id()).await.unwrap();
+    keystore
+        .add_key(&key_pair, alice_account.id())
+        .await
+        .unwrap();
+    fund_account_for_fees(&mut client, alice_account.id(), &fee_config).await?;
 
     println!(
         "Alice's account ID: {:?}",
-        alice_account.id().to_bech32(NetworkId::Testnet)
+        alice_account.id().to_bech32(network.network_id())
     );
 
     Ok(())
@@ -262,9 +280,17 @@ This step initializes the Miden client and creates a basic user account (Alice) 
 
 ## Step 4: Create the network counter smart contract
 
-Now we'll create the network smart contract. In v0.15 what makes an account network-executable is its auth component, not a storage mode: the contract is a public account (`AccountType::Public`) built with the `AuthNetworkAccount` component. Its note-script allowlist is what marks the account as a network account, and its transaction-script allowlist authorizes the deploy script in Step 5. Both allowlists are fixed at account creation, so we compile the note script and the deploy transaction script first and pass their MAST roots in.
+Build a public account with `AuthNetworkAccount`, the counter component, and
+`BasicWallet`. Compile the increment note first so its root can be allowlisted.
+Also allow the P2ID funding note. Use `AuthNetworkAccount::custom` for this minimal
+account and explicitly allow `ExpirationTransactionScript::script_root()`, which
+the network builder uses. No configuration or sponsorship note scripts are
+enabled: this account does not implement their required authority components.
+There is no custom increment transaction script to allowlist. The zero per-note
+policy charge does not remove the network's verification fee: the account pays
+that fee from its funded native-asset balance.
 
-Add this code to your `main()` function:
+Insert this code inside `main`, immediately before its final `Ok(())`:
 
 ```rust ignore
 // -------------------------------------------------------------------------
@@ -272,44 +298,28 @@ Add this code to your `main()` function:
 // -------------------------------------------------------------------------
 println!("\n[STEP 2] Creating a network counter smart contract");
 
-// `include_str!` resolves at compile time relative to this source file,
-// so the binary is independent of the working directory it is run from.
-let counter_code = include_str!("../masm/accounts/counter.masm");
-let script_code = include_str!("../masm/scripts/counter_script.masm");
-let network_note_code = include_str!("../masm/notes/network_increment_note.masm");
+// Read the MASM source from the tutorials repository.
+let counter_code = std::fs::read_to_string("../tutorials/masm/accounts/counter.masm").unwrap();
+let network_note_code =
+    std::fs::read_to_string("../tutorials/masm/notes/network_increment_note.masm").unwrap();
 
-// In protocol v0.15 an account is a *network account* (one the network
+// An account is a *network account* (one the network
 // transaction builder executes on a user's behalf) if and only if it is
 // public AND carries the `AuthNetworkAccount` auth component. That component
-// holds two allowlists, both fixed at account creation:
-//   * the note-script allowlist: its presence is what marks the account as a
-//     network account, and the builder only executes notes whose script root
-//     is listed here;
-//   * the tx-script allowlist: the network auth procedure rejects any custom
-//     tx script whose root is not listed, so the STEP 3 deploy script must be
-//     in it.
-// We therefore compile the note script and the deploy tx script now and feed
-// their MAST roots into the allowlists below. Both compiled scripts are reused
-// as-is in STEP 3 (tx script) and STEP 4 (note script) — nothing is compiled
-// twice.
+// holds an allowlist of note scripts the network builder may execute.
+// Compile the increment note first so its root can be included at creation.
 let note_script = client
     .code_builder()
-    .with_linked_module("external_contract::counter_contract", counter_code)?
-    .compile_note_script(network_note_code)?;
+    .with_linked_module("external_contract::counter_contract", &counter_code)?
+    .compile_note_script(&network_note_code)?;
 let note_script_root = note_script.root();
-
-let tx_script = client
-    .code_builder()
-    .with_linked_module("external_contract::counter_contract", counter_code)?
-    .compile_tx_script(script_code)?;
-let tx_script_root = tx_script.root();
 
 // Compile the counter MASM into an account component
 let counter_slot_name =
     StorageSlotName::new("miden::tutorials::counter").expect("valid slot name");
 let component_code = client
     .code_builder()
-    .compile_component_code("external_contract::counter_contract", counter_code)?;
+    .compile_component_code("external_contract::counter_contract", &counter_code)?;
 let counter_component = AccountComponent::new(
     component_code,
     vec![StorageSlot::with_value(
@@ -323,68 +333,83 @@ let counter_component = AccountComponent::new(
 let mut init_seed = [0_u8; 32];
 client.rng().fill_bytes(&mut init_seed);
 
-// Build the network account: public + `AuthNetworkAccount` with the note-script
-// root allowlisted (this is what makes it a network account) and the deploy
-// tx-script root allowlisted (so the auth procedure accepts the STEP 3 deploy).
-let network_auth = AuthNetworkAccount::with_allowed_notes(BTreeSet::from([note_script_root]))?
-    .with_allowed_tx_scripts(BTreeSet::from([tx_script_root]));
+// Build the public network account with the increment and funding notes allowed.
+let fee_policy: FeePolicy = BasicConstantFeePolicy::new()
+    .with_fees(
+        [note_script_root, P2idNote::script_root()].map(|root| (root, AssetAmount::ZERO)),
+    )
+    .into();
+let fee_policy_manager = FeePolicyManager::builder()
+    .fee_faucet_id(fee_faucet_id)
+    .active_fee_policy(fee_policy)
+    .build();
+// Match the protocol/node counter example: only permit the two note scripts
+// this account implements. Config notes need Authority, which it does not have.
+// The canonical expiration script is required by the network builder.
+let network_auth = AuthNetworkAccount::custom(
+    BTreeSet::from([note_script_root, P2idNote::script_root()]),
+    fee_policy_manager,
+)?
+.with_allowed_tx_scripts([ExpirationTransactionScript::script_root()]);
 let counter_contract = AccountBuilder::new(init_seed)
     .account_type(AccountType::Public)
-    .with_auth_component(network_auth)
+    .with_components(network_auth)
     .with_component(counter_component)
+    .with_component(BasicWallet)
     .build()
     .unwrap();
 
 client.add_account(&counter_contract, false).await.unwrap();
+fund_account_for_fees(&mut client, counter_contract.id(), &fee_config).await?;
 
 println!(
     "contract id: {:?}",
-    counter_contract.id().to_bech32(NetworkId::Testnet)
+    counter_contract.id().to_bech32(network.network_id())
 );
 ```
 
-This step creates a public smart contract (`AccountType::Public`) whose `AuthNetworkAccount` component allowlists the increment note's script root — marking it as a network account the operator will execute — and the deploy transaction script's root, so the Step 5 deploy is authorized.
+This step creates and funds a public network account. On a fee-enabled network,
+the funding transaction also publishes it. Its counter remains zero.
 
-## Step 5: Deploy the network account with a transaction script
+## Step 5: Confirm publication of the network account
 
-We use a transaction script to deploy the network account and ensure it's properly registered on-chain. The script calls the `increment` function, which initializes the counter to 1.
+When fees are active, initial funding has already published the network account. Do not send
+another direct increment transaction from the user client: the node rejects
+user-submitted updates to existing network accounts. Only the zero-fee path needs
+an explicit first deployment transaction here.
 
-Add this code to your `main()` function:
+Insert this code after account creation, inside `main` and before `Ok(())`:
 
 ```rust ignore
 // -------------------------------------------------------------------------
-// STEP 3: Deploy Network Account with Transaction Script
+// STEP 3: Publish the network account
 // -------------------------------------------------------------------------
 println!("\n[STEP 3] Deploy network counter smart contract");
 
-// Reuse the `tx_script` compiled in STEP 2 (its root is allowlisted on the
-// account, so the network auth procedure accepts this deploy transaction).
-let tx_increment_request = TransactionRequestBuilder::new()
-    .custom_script(tx_script)
-    .build()
-    .unwrap();
-
-let tx_id = client
-    .submit_new_transaction(counter_contract.id(), tx_increment_request)
-    .await
-    .unwrap();
-
-println!(
-    "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
-    tx_id
-);
-
-// Wait for the transaction to be committed
-wait_for_tx(&mut client, tx_id).await.unwrap();
+// On a fee-enabled network, consuming the funding note already published this
+// account. RPC permits users to deploy new network accounts, but rejects
+// user-submitted transactions for existing ones. Subsequent increments must
+// be requested by notes and executed by the network transaction builder.
+if !fee_config.fees_are_active() {
+    let deployment = TransactionRequestBuilder::new().build()?;
+    client
+        .submit_tutorial_transaction(counter_contract.id(), deployment)
+        .await?;
+}
+println!("Network counter deployed; initial count is 0");
 ```
 
-This step uses a transaction script to deploy the network account and ensure it's properly registered on-chain. The script calls the `increment` function, which initializes the counter to 1.
+The initial committed count is zero. All later counter updates go through network
+notes executed by the network transaction builder.
 
 ## Step 6: Create a network note for user interaction
 
-We create a public note that the network operator can consume to execute the increment function. This increments the counter from 1 to 2.
+Alice publishes a public increment note from her own funded account. The network
+transaction builder then consumes that note on the counter's behalf, changing
+the counter from zero to one. Confirmation of Alice's transaction alone is not
+enough; the example also waits for the counter's updated state.
 
-Add this code to your `main()` function:
+Replace the final `Ok(())` in `main` with the following fragment. Its polling loop and final `Err(...)` expressions provide the function's result:
 
 ```rust ignore
 // -------------------------------------------------------------------------
@@ -420,11 +445,12 @@ let note_req = TransactionRequestBuilder::new()
     .build()?;
 
 let note_tx_id = client
-    .submit_new_transaction(alice_account.id(), note_req)
+    .submit_tutorial_transaction(alice_account.id(), note_req)
     .await?;
 
 println!(
-    "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+    "View transaction on MidenScan: {}/tx/{:?}",
+    network.explorer_url(),
     note_tx_id
 );
 
@@ -439,7 +465,7 @@ wait_for_tx(&mut client, note_tx_id).await.unwrap();
 sleep(Duration::from_secs(6)).await;
 
 let mut last_val = None;
-for _ in 0..10 {
+for _ in 0..24 {
     client.sync_state().await?;
 
     // Checking updated state
@@ -452,7 +478,7 @@ for _ in 0..10 {
             .unwrap()
             .into();
         let val = count[0].as_canonical_u64();
-        if val >= 2 {
+        if val == 1 {
             println!("🔢 Final counter value: {}", val);
             return Ok(());
         }
@@ -464,12 +490,12 @@ for _ in 0..10 {
 }
 
 // The network note was submitted, but it is executed asynchronously by the
-// network transaction builder. If the counter has not reached 2 within the
+// network transaction builder. If the counter has not reached 1 within the
 // polling window, the tutorial's final state is unconfirmed, so fail rather
 // than claim success.
 if let Some(val) = last_val {
     Err(format!(
-        "Counter did not reach the expected value 2 within the timeout (last observed {}). \
+        "Counter did not reach the expected value 1 within the timeout (last observed {}). \
          The network note was submitted but its execution is still pending on the network \
          transaction builder; re-run or check Midenscan.",
         val
@@ -481,78 +507,57 @@ if let Some(val) = last_val {
 }
 ```
 
-This step creates a public note that the network operator can consume to execute the increment function. This increments the counter from 1 to 2.
+## Complete example
 
-## Summary
-
-Your complete `main()` function should look like this:
+Your complete `src/main.rs` file should look like this:
 
 ```rust no_run
+use rust_client::TutorialClientExt;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use miden_client::{
+    Client, ClientError, Felt, Word,
     account::{
-        component::{AccountComponentMetadata, AuthNetworkAccount, BasicWallet}, AccountBuilder, AccountComponent,
-        AccountType, StorageSlot, StorageSlotName,
+        AccountBuilder, AccountComponent, AccountType, StorageSlot, StorageSlotName,
+        component::{
+            AccountComponentMetadata, AuthNetworkAccount, BasicConstantFeePolicy, BasicWallet,
+            FeePolicy, FeePolicyManager,
+        },
     },
-    address::NetworkId,
-    auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
+    asset::AssetAmount,
+    auth::{AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,
     crypto::FeltRng,
     keystore::{FilesystemKeyStore, Keystore},
     note::{
         NetworkAccountTarget, Note, NoteAssets, NoteAttachments, NoteError, NoteExecutionHint,
-        NoteRecipient, NoteStorage, NoteTag, NoteType, PartialNoteMetadata,
+        NoteRecipient, NoteStorage, NoteTag, NoteType, P2idNote, PartialNoteMetadata,
     },
-    rpc::{Endpoint, GrpcClient},
-    store::TransactionFilter,
-    transaction::{
-        TransactionId, TransactionRequestBuilder, TransactionStatus,
-    },
-    Client, ClientError, Felt, Word,
+    rpc::{GrpcClient, VerifyingRpcClient},
+    transaction::{ExpirationTransactionScript, TransactionId, TransactionRequestBuilder},
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use rand::RngCore;
-use tokio::time::{sleep, Duration};
+use rand::Rng;
+use rust_client::{FeeConfig, TutorialNetwork, fund_account_for_fees};
+use tokio::time::{Duration, sleep};
 
 /// Waits for a specific transaction to be committed.
 async fn wait_for_tx(
     client: &mut Client<FilesystemKeyStore>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
+    rust_client::wait_for_transaction(client, tx_id).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -564,12 +569,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
+    let fee_faucet_id = fee_config.native_fee_faucet_id();
 
     // -------------------------------------------------------------------------
     // STEP 1: Create Basic User Account
@@ -585,7 +591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the account
     let alice_account = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(AuthSingleSig::from_public_key(key_pair.public_key()))
         .with_component(BasicWallet)
         .build()
         .unwrap();
@@ -594,11 +600,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.add_account(&alice_account, false).await?;
 
     // Add the key pair to the keystore
-    keystore.add_key(&key_pair, alice_account.id()).await.unwrap();
+    keystore
+        .add_key(&key_pair, alice_account.id())
+        .await
+        .unwrap();
+    fund_account_for_fees(&mut client, alice_account.id(), &fee_config).await?;
 
     println!(
         "Alice's account ID: {:?}",
-        alice_account.id().to_bech32(NetworkId::Testnet)
+        alice_account.id().to_bech32(network.network_id())
     );
 
     // -------------------------------------------------------------------------
@@ -606,44 +616,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
     println!("\n[STEP 2] Creating a network counter smart contract");
 
-    // `include_str!` resolves at compile time relative to this source file,
-    // so the binary is independent of the working directory it is run from.
-    let counter_code = include_str!("../masm/accounts/counter.masm");
-    let script_code = include_str!("../masm/scripts/counter_script.masm");
-    let network_note_code = include_str!("../masm/notes/network_increment_note.masm");
+    // Read the MASM source from the tutorials repository.
+    let counter_code = std::fs::read_to_string("../tutorials/masm/accounts/counter.masm").unwrap();
+    let network_note_code =
+        std::fs::read_to_string("../tutorials/masm/notes/network_increment_note.masm").unwrap();
 
-    // In protocol v0.15 an account is a *network account* (one the network
+    // An account is a *network account* (one the network
     // transaction builder executes on a user's behalf) if and only if it is
     // public AND carries the `AuthNetworkAccount` auth component. That component
-    // holds two allowlists, both fixed at account creation:
-    //   * the note-script allowlist: its presence is what marks the account as a
-    //     network account, and the builder only executes notes whose script root
-    //     is listed here;
-    //   * the tx-script allowlist: the network auth procedure rejects any custom
-    //     tx script whose root is not listed, so the STEP 3 deploy script must be
-    //     in it.
-    // We therefore compile the note script and the deploy tx script now and feed
-    // their MAST roots into the allowlists below. Both compiled scripts are reused
-    // as-is in STEP 3 (tx script) and STEP 4 (note script) — nothing is compiled
-    // twice.
+    // holds an allowlist of note scripts the network builder may execute.
+    // Compile the increment note first so its root can be included at creation.
     let note_script = client
         .code_builder()
-        .with_linked_module("external_contract::counter_contract", counter_code)?
-        .compile_note_script(network_note_code)?;
+        .with_linked_module("external_contract::counter_contract", &counter_code)?
+        .compile_note_script(&network_note_code)?;
     let note_script_root = note_script.root();
-
-    let tx_script = client
-        .code_builder()
-        .with_linked_module("external_contract::counter_contract", counter_code)?
-        .compile_tx_script(script_code)?;
-    let tx_script_root = tx_script.root();
 
     // Compile the counter MASM into an account component
     let counter_slot_name =
         StorageSlotName::new("miden::tutorials::counter").expect("valid slot name");
     let component_code = client
         .code_builder()
-        .compile_component_code("external_contract::counter_contract", counter_code)?;
+        .compile_component_code("external_contract::counter_contract", &counter_code)?;
     let counter_component = AccountComponent::new(
         component_code,
         vec![StorageSlot::with_value(
@@ -657,49 +651,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    // Build the network account: public + `AuthNetworkAccount` with the note-script
-    // root allowlisted (this is what makes it a network account) and the deploy
-    // tx-script root allowlisted (so the auth procedure accepts the STEP 3 deploy).
-    let network_auth = AuthNetworkAccount::with_allowed_notes(BTreeSet::from([note_script_root]))?
-        .with_allowed_tx_scripts(BTreeSet::from([tx_script_root]));
+    // Build the public network account with the increment and funding notes allowed.
+    let fee_policy: FeePolicy = BasicConstantFeePolicy::new()
+        .with_fees(
+            [note_script_root, P2idNote::script_root()].map(|root| (root, AssetAmount::ZERO)),
+        )
+        .into();
+    let fee_policy_manager = FeePolicyManager::builder()
+        .fee_faucet_id(fee_faucet_id)
+        .active_fee_policy(fee_policy)
+        .build();
+    // Match the protocol/node counter example: only permit the two note scripts
+    // this account implements. Config notes need Authority, which it does not have.
+    // The canonical expiration script is required by the network builder.
+    let network_auth = AuthNetworkAccount::custom(
+        BTreeSet::from([note_script_root, P2idNote::script_root()]),
+        fee_policy_manager,
+    )?
+    .with_allowed_tx_scripts([ExpirationTransactionScript::script_root()]);
     let counter_contract = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(network_auth)
+        .with_components(network_auth)
         .with_component(counter_component)
+        .with_component(BasicWallet)
         .build()
         .unwrap();
 
     client.add_account(&counter_contract, false).await.unwrap();
+    fund_account_for_fees(&mut client, counter_contract.id(), &fee_config).await?;
 
     println!(
         "contract id: {:?}",
-        counter_contract.id().to_bech32(NetworkId::Testnet)
+        counter_contract.id().to_bech32(network.network_id())
     );
 
     // -------------------------------------------------------------------------
-    // STEP 3: Deploy Network Account with Transaction Script
+    // STEP 3: Publish the network account
     // -------------------------------------------------------------------------
     println!("\n[STEP 3] Deploy network counter smart contract");
 
-    // Reuse the `tx_script` compiled in STEP 2 (its root is allowlisted on the
-    // account, so the network auth procedure accepts this deploy transaction).
-    let tx_increment_request = TransactionRequestBuilder::new()
-        .custom_script(tx_script)
-        .build()
-        .unwrap();
-
-    let tx_id = client
-        .submit_new_transaction(counter_contract.id(), tx_increment_request)
-        .await
-        .unwrap();
-
-    println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
-        tx_id
-    );
-
-    // Wait for the transaction to be committed
-    wait_for_tx(&mut client, tx_id).await.unwrap();
+    // On a fee-enabled network, consuming the funding note already published this
+    // account. RPC permits users to deploy new network accounts, but rejects
+    // user-submitted transactions for existing ones. Subsequent increments must
+    // be requested by notes and executed by the network transaction builder.
+    if !fee_config.fees_are_active() {
+        let deployment = TransactionRequestBuilder::new().build()?;
+        client
+            .submit_tutorial_transaction(counter_contract.id(), deployment)
+            .await?;
+    }
+    println!("Network counter deployed; initial count is 0");
 
     // -------------------------------------------------------------------------
     // STEP 4: Prepare & Create the Network Note
@@ -734,11 +735,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let note_tx_id = client
-        .submit_new_transaction(alice_account.id(), note_req)
+        .submit_tutorial_transaction(alice_account.id(), note_req)
         .await?;
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         note_tx_id
     );
 
@@ -753,7 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sleep(Duration::from_secs(6)).await;
 
     let mut last_val = None;
-    for _ in 0..10 {
+    for _ in 0..24 {
         client.sync_state().await?;
 
         // Checking updated state
@@ -766,7 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap()
                 .into();
             let val = count[0].as_canonical_u64();
-            if val >= 2 {
+            if val == 1 {
                 println!("🔢 Final counter value: {}", val);
                 return Ok(());
             }
@@ -778,12 +780,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The network note was submitted, but it is executed asynchronously by the
-    // network transaction builder. If the counter has not reached 2 within the
+    // network transaction builder. If the counter has not reached 1 within the
     // polling window, the tutorial's final state is unconfirmed, so fail rather
     // than claim success.
     if let Some(val) = last_val {
         Err(format!(
-            "Counter did not reach the expected value 2 within the timeout (last observed {}). \
+            "Counter did not reach the expected value 1 within the timeout (last observed {}). \
              The network note was submitted but its execution is still pending on the network \
              transaction builder; re-run or check Midenscan.",
             val
@@ -798,38 +800,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Step 7: Running the Example
 
-To run the complete network transaction example:
+For the standalone Cargo project, run `TUTORIAL_NETWORK=testnet cargo run --release` from `miden-network-transactions`.
+
+To run the checked-in example from the repository root:
 
 ```bash
 cd rust-client
-cargo run --release --bin network_notes_counter_contract
+TUTORIAL_NETWORK=testnet cargo run --release --bin network_notes_counter_contract
 ```
 
-Expected output:
+Successful output has this shape (abridged; IDs and block numbers vary):
 
 ```text
-Latest block: 486537
+Latest block: <block_number>
 
 [STEP 1] Creating a new account for Alice
-Alice's account ID: "mtst1aqcmenmxlqkw8ugn005s7r09kq0xpqp9"
+Alice's account ID: "<testnet_account_id>"
 
 [STEP 2] Creating a network counter smart contract
-one or more warnings were emitted
-one or more warnings were emitted
-one or more warnings were emitted
-contract id: "mtst1aqtvag789v45tvtqdaknugytf5d5gxxu"
+contract id: "<testnet_account_id>"
 
 [STEP 3] Deploy network counter smart contract
-View transaction on MidenScan: https://testnet.midenscan.com/tx/0x37c202efb825f0c7a55bd4416858fbe2d30064a5b1e557876a0053ed5307607f
-Transaction 0x37c202efb825f0c7a55bd4416858fbe2d30064a5b1e557876a0053ed5307607f not yet committed. Waiting...
-✅ transaction 0x37c202efb825f0c7a55bd4416858fbe2d30064a5b1e557876a0053ed5307607f committed
+Network counter deployed; initial count is 0
 
 [STEP 4] Creating a network note for network counter contract
-View transaction on MidenScan: https://testnet.midenscan.com/tx/0xa5ec0baa9443a0f5aa056bd4c0e4583c5c3f5a5163aa0536b469a0255b489f75
+View transaction on MidenScan: https://testnet.midenscan.com/tx/<transaction_id>
 network increment note creation tx submitted, waiting for onchain commitment
-Transaction 0xa5ec0baa9443a0f5aa056bd4c0e4583c5c3f5a5163aa0536b469a0255b489f75 not yet committed. Waiting...
-✅ transaction 0xa5ec0baa9443a0f5aa056bd4c0e4583c5c3f5a5163aa0536b469a0255b489f75 committed
-🔢 Final counter value: 2
+🔢 Final counter value: 1
 ```
 
 ## Summary
@@ -837,8 +834,8 @@ Transaction 0xa5ec0baa9443a0f5aa056bd4c0e4583c5c3f5a5163aa0536b469a0255b489f75 n
 Network transactions on Miden enable powerful use cases by allowing the operator to execute transactions on behalf of users. The key steps are:
 
 1. **Create user account**: Standard account creation for interaction
-2. **Create network account**: Build a public account (`AccountType::Public`) with the `AuthNetworkAccount` auth component, allowlisting the note-script root (this is what marks it as a network account) and the deploy transaction-script root
-3. **Deploy with transaction script**: Ensures the contract is registered on-chain
+2. **Create network account**: Build a public account with `AuthNetworkAccount`, allowlisting the increment and funding note scripts
+3. **Publish and fund it**: The initial native-asset consumption transaction registers the new account with count zero
 4. **Interact with network notes**: Users create public notes that the operator executes
 
 The same MASM code works for both regular and network contracts — the difference is purely in the Rust configuration (the `AuthNetworkAccount` auth component and its allowlists). This makes network transactions a powerful tool for building applications like AMMs where multiple users need to interact with shared state efficiently.

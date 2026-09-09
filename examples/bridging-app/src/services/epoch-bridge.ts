@@ -57,16 +57,16 @@ export function formatQuoteTokenIn(
 }
 
 /**
- * Cross-chain bridge architecture using P2ID notes:
+ * Cross-chain bridge architecture using reclaimable P2IDE collateral notes:
  *
- * 1. User creates a P2ID note on Miden targeting the trusted allocator service
- * 2. The allocator service (holding the P2ID note) builds an Epoch intent via SIO
+ * 1. User creates a mandate-bound P2IDE note targeting the trusted allocator
+ * 2. The allocator service validates the note and routes the intent via SIO
  * 3. SIO solver fulfills the intent on the destination EVM chain
- * 4. On successful execution, the allocator consumes the P2ID note (claiming the Miden funds)
- * 5. If the intent fails/expires, the P2ID note can be recalled by the user
+ * 4. On successful execution, the allocator consumes the note (claiming the Miden funds)
+ * 5. After the reclaim height, the user can recall an unconsumed collateral note
  *
- * This keeps funds locked in a P2ID note (not custodied) until the cross-chain
- * intent is fulfilled — privacy-preserving on the Miden side, trustless on EVM side.
+ * The allocator is a trusted participant: the note's reclaim path does not by
+ * itself enforce EVM settlement or prevent the target from consuming the note.
  */
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -74,24 +74,16 @@ const ZERO_HASH = '0x00000000000000000000000000000000000000000000000000000000000
 
 function normalizeMidenIdToHex(id: string): string {
   const raw = (id ?? '').trim();
-  if (!raw) return raw;
+  if (!raw) throw new Error('A Miden account or faucet ID is required');
 
   // Already hex.
   if (raw.startsWith('0x') || raw.startsWith('0X')) {
-    try {
-      return AccountId.fromHex(raw).toString();
-    } catch {
-      return raw;
-    }
+    return AccountId.fromHex(raw).toString();
   }
 
   // Plain hex without 0x.
   if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
-    try {
-      return AccountId.fromHex(`0x${raw}`).toString();
-    } catch {
-      return raw;
-    }
+    return AccountId.fromHex(`0x${raw}`).toString();
   }
 
   // Bech32 (address or account). Wallet adapter often returns `mtst..._...`.
@@ -105,8 +97,8 @@ function normalizeMidenIdToHex(id: string): string {
 
   try {
     return AccountId.fromBech32(raw).toString();
-  } catch {
-    return raw;
+  } catch (cause) {
+    throw new Error(`Invalid Miden account or faucet ID: ${raw}`, { cause });
   }
 }
 
@@ -344,7 +336,7 @@ export async function buildCrossChainIntent(
   params: CrossChainIntentParams & {
     collateralType?: CollateralType;
     midenSourceAccount?: string;
-    createMidenP2IDNote?: SolveIntentParams['createMidenP2IDNote'];
+    createMidenP2IDENote?: SolveIntentParams['createMidenP2IDENote'];
     /** Pre-fetched quote from getCrossChainQuote — skips getTaskData step. */
     preFetchedQuote?: CrossChainQuote;
   },
@@ -374,7 +366,7 @@ export async function buildCrossChainIntent(
       collateralType: (params.collateralType ?? 'miden') as CollateralType,
       midenFaucetId: midenFaucetIdHex,
       midenSourceAccount: midenSourceHex,
-      createMidenP2IDNote: params.createMidenP2IDNote,
+      createMidenP2IDENote: params.createMidenP2IDENote,
     });
 
     console.log('[EpochBridge] SDK.solveIntent() response:', solveResult);

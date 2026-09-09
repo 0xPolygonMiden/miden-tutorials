@@ -1,18 +1,19 @@
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
 use tokio::time::{sleep, Duration};
 
 use miden_client::{
     account::{
         component::{
-            BasicWallet, BurnPolicyConfig, FungibleFaucet, MintPolicyConfig, PolicyRegistration,
-            TokenName, TokenPolicyManager,
+            create_singlesig_user_fungible_faucet, BasicWallet, BurnPolicy, FungibleFaucet,
+            MintPolicy, TokenName, TokenPolicyManager,
         },
         Account, AccountBuilder, AccountType,
     },
     address::NetworkId,
-    asset::{AssetAmount, FungibleAsset, TokenSymbol},
-    auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
+    asset::{AssetAmount, AssetId, FungibleAsset, TokenSymbol},
+    auth::{AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,
     crypto::FeltRng,
     keystore::{FilesystemKeyStore, Keystore},
@@ -20,12 +21,12 @@ use miden_client::{
         Note, NoteAssets, NoteDetails, NoteRecipient, NoteStorage, NoteTag, NoteType,
         PartialNoteMetadata,
     },
-    rpc::{Endpoint, GrpcClient},
-    store::TransactionFilter,
-    transaction::{TransactionId, TransactionRequestBuilder, TransactionStatus},
+    rpc::{GrpcClient, VerifyingRpcClient},
+    transaction::{TransactionId, TransactionRequestBuilder},
     Client, ClientError, Felt,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{fund_account_for_fees, FeeConfig, TutorialNetwork};
 
 // Helper to create a basic account
 async fn create_basic_account(
@@ -39,7 +40,7 @@ async fn create_basic_account(
 
     let account = AccountBuilder::new(init_seed)
         .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(AuthSingleSig::from_public_key(key_pair.public_key()))
         .with_component(BasicWallet)
         .build()
         .unwrap();
@@ -62,27 +63,25 @@ async fn create_basic_faucet(
     let decimals = 8;
     let max_supply = AssetAmount::new(1_000_000).unwrap();
 
-    let account = AccountBuilder::new(init_seed)
-        .account_type(AccountType::Public)
-        .with_auth_component(AuthSingleSig::new(key_pair.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2))
-        .with_component(
-            FungibleFaucet::builder()
-                .name(TokenName::new("MID").unwrap())
-                .symbol(symbol)
-                .decimals(decimals)
-                .max_supply(max_supply)
-                .build()
-                .unwrap(),
-        )
-        .with_components(
-            TokenPolicyManager::new()
-                .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
-                .unwrap()
-                .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
-                .unwrap(),
-        )
+    let faucet = FungibleFaucet::builder()
+        .name(TokenName::new("MID").unwrap())
+        .symbol(symbol)
+        .decimals(decimals)
+        .max_supply(max_supply)
         .build()
         .unwrap();
+    let policies = TokenPolicyManager::builder()
+        .active_mint_policy(MintPolicy::allow_all())
+        .active_burn_policy(BurnPolicy::allow_all())
+        .build();
+    let account = create_singlesig_user_fungible_faucet(
+        init_seed,
+        faucet,
+        AuthSingleSig::from_public_key(key_pair.public_key()),
+        policies,
+        AccountType::Public,
+    )
+    .unwrap();
 
     client.add_account(&account, false).await?;
     keystore.add_key(&key_pair, account.id()).await.unwrap();
@@ -95,21 +94,29 @@ async fn wait_for_notes(
     client: &mut Client<FilesystemKeyStore>,
     account_id: &Account,
     expected: usize,
+    network_id: NetworkId,
 ) -> Result<(), ClientError> {
-    loop {
+    for _ in 0..24 {
         client.sync_state().await?;
-        let notes = client.get_consumable_notes(Some(account_id.id())).await?;
+        let notes = client
+            .get_consumable_tutorial_notes(Some(account_id.id()))
+            .await?;
         if notes.len() >= expected {
-            break;
+            return Ok(());
         }
         println!(
             "{} consumable notes found for account {}. Waiting...",
             notes.len(),
-            account_id.id().to_bech32(NetworkId::Testnet)
+            account_id.id().to_bech32(network_id.clone())
         );
         sleep(Duration::from_secs(3)).await;
     }
-    Ok(())
+    Err(ClientError::Observer(Box::new(std::io::Error::other(
+        format!(
+            "timed out waiting for {expected} tutorial notes for {}",
+            account_id.id()
+        ),
+    ))))
 }
 
 /// Waits for a specific transaction to be committed.
@@ -117,39 +124,18 @@ async fn wait_for_tx(
     client: &mut Client<FilesystemKeyStore>,
     tx_id: TransactionId,
 ) -> Result<(), ClientError> {
-    loop {
-        client.sync_state().await?;
-
-        // Check transaction status
-        let txs = client
-            .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-            .await?;
-        let tx_committed = if !txs.is_empty() {
-            matches!(txs[0].status, TransactionStatus::Committed { .. })
-        } else {
-            false
-        };
-
-        if tx_committed {
-            println!("✅ transaction {} committed", tx_id.to_hex());
-            break;
-        }
-
-        println!(
-            "Transaction {} not yet committed. Waiting...",
-            tx_id.to_hex()
-        );
-        sleep(Duration::from_secs(2)).await;
-    }
-    Ok(())
+    rust_client::wait_for_transaction(client, tx_id).await
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -161,12 +147,12 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Create accounts and deploy faucet
@@ -175,20 +161,23 @@ async fn main() -> Result<(), ClientError> {
     let alice_account = create_basic_account(&mut client, &keystore).await?;
     println!(
         "Alice's account ID: {:?}",
-        alice_account.id().to_bech32(NetworkId::Testnet)
+        alice_account.id().to_bech32(network.network_id())
     );
     let bob_account = create_basic_account(&mut client, &keystore).await?;
     println!(
         "Bob's account ID: {:?}",
-        bob_account.id().to_bech32(NetworkId::Testnet)
+        bob_account.id().to_bech32(network.network_id())
     );
 
     println!("\nDeploying a new fungible faucet.");
     let faucet = create_basic_faucet(&mut client, &keystore).await?;
     println!(
         "Faucet account ID: {:?}",
-        faucet.id().to_bech32(NetworkId::Testnet)
+        faucet.id().to_bech32(network.network_id())
     );
+    for account_id in [alice_account.id(), bob_account.id(), faucet.id()] {
+        fund_account_for_fees(&mut client, account_id, &fee_config).await?;
+    }
     client.sync_state().await?;
 
     // -------------------------------------------------------------------------
@@ -208,14 +197,16 @@ async fn main() -> Result<(), ClientError> {
         )
         .unwrap();
 
-    let tx_id = client.submit_new_transaction(faucet.id(), tx_req).await?;
+    let tx_id = client
+        .submit_tutorial_transaction(faucet.id(), tx_req)
+        .await?;
     println!("Minted tokens. TX: {:?}", tx_id);
 
-    wait_for_notes(&mut client, &alice_account, 1).await?;
+    wait_for_notes(&mut client, &alice_account, 1, network.network_id()).await?;
 
     // Consume the minted note
     let consumable_notes = client
-        .get_consumable_notes(Some(alice_account.id()))
+        .get_consumable_tutorial_notes(Some(alice_account.id()))
         .await?;
 
     if let Some((note_record, _)) = consumable_notes.first() {
@@ -223,7 +214,7 @@ async fn main() -> Result<(), ClientError> {
         let consume_req = TransactionRequestBuilder::new().build_consume_notes(vec![note])?;
 
         let tx_id = client
-            .submit_new_transaction(alice_account.id(), consume_req)
+            .submit_tutorial_transaction(alice_account.id(), consume_req)
             .await?;
         println!("Consumed minted note. TX: {:?}", tx_id);
     }
@@ -262,10 +253,11 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
 
     let tx_id = client
-        .submit_new_transaction(alice_account.id(), note_req)
+        .submit_tutorial_transaction(alice_account.id(), note_req)
         .await?;
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
@@ -307,14 +299,40 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
 
     let tx_id = client
-        .submit_new_transaction(bob_account.id(), consume_custom_req)
+        .submit_tutorial_transaction(bob_account.id(), consume_custom_req)
         .await?;
     println!(
-        "Consumed Note Tx on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "Consumed Note Tx on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
     wait_for_tx(&mut client, tx_id).await?;
+
+    // The SDK verifies expected recipients; also check the actual successor's assets and metadata.
+    let successor = client
+        .get_output_note(output_note.id())
+        .await?
+        .expect("the transaction must create the expected successor note");
+    assert!(successor.is_committed(), "the successor must be committed");
+    assert_eq!(successor.assets(), output_note.assets());
+    assert_eq!(successor.metadata(), output_note.metadata());
+    println!(
+        "Successor note committed with 50 tokens: {}",
+        successor.id()
+    );
+
+    let bob = client
+        .get_account(bob_account.id())
+        .await?
+        .expect("Bob's account must exist after consuming the note");
+    let balance = bob.vault().get_balance(AssetId::new_fungible(faucet_id))?;
+    assert_eq!(
+        balance.as_u64(),
+        50,
+        "Bob must retain the other half of the note's tokens",
+    );
+    println!("Bob's retained token balance: {balance}");
 
     Ok(())
 }

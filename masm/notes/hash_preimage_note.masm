@@ -1,47 +1,57 @@
 use miden::protocol::active_note
-use miden::standards::wallets::basic->wallet
+use miden::standards::wallets::basic as wallet
 
 # CONSTANTS
 # =================================================================================================
 
-const EXPECTED_DIGEST_PTR=0
+const EXPECTED_DIGEST_PTR = 0
 
 # ERRORS
 # =================================================================================================
 
-const ERROR_DIGEST_MISMATCH="Expected digest does not match computed digest"
+const ERROR_DIGEST_MISMATCH = "Expected digest does not match computed digest"
 
-#! Inputs (arguments):  [HASH_PREIMAGE_SECRET]
-#! Outputs: []
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Consumes the note's assets when the secret hashes to its stored digest.
 #!
-#! Note storage is assumed to be as follows:
-#!  => EXPECTED_DIGEST
+#! Inputs:  [HASH_PREIMAGE_SECRET, pad(12)]
+#! Outputs: [pad(16)]
+#!
+#! Where:
+#! - HASH_PREIMAGE_SECRET is the four-felt secret supplied as note arguments.
+#!
+#! Panics if:
+#! - the supplied secret does not match the digest stored in the note.
+#!
+#! Invocation: dyncall
 @note_script
-pub proc main
-    # => HASH_PREIMAGE_SECRET
-    # Hashing the secret number
+pub proc main(hash_preimage_secret: word)
+    # => [HASH_PREIMAGE_SECRET, pad(12)]
+    # hashing the secret number
     hash
-    # => [DIGEST]
+    # => [DIGEST, pad(12)]
 
-    # Writing the note storage to memory.
+    # writing the note storage to memory.
     # get_storage leaves only [num_storage_items], so drop a single element
     # here, not two, to keep the computed DIGEST intact.
     push.EXPECTED_DIGEST_PTR exec.active_note::get_storage drop
 
-    # Pad stack and load expected digest from memory (LE: mem[addr] ends up on top)
+    # pad stack and load expected digest from memory (LE: mem[addr] ends up on top)
     padw push.EXPECTED_DIGEST_PTR mem_loadw_le
-    # => [EXPECTED_DIGEST, DIGEST]
+    # => [EXPECTED_DIGEST, DIGEST, pad(12)]
 
-    # Assert that the note input matches the digest
-    # Will fail if the two hashes do not match
+    # assert that the note input matches the digest
+    # will fail if the two hashes do not match
     assert_eqw.err=ERROR_DIGEST_MISMATCH
-    # => []
+    # => [pad(16)]
 
     # ---------------------------------------------------------------------------------------------
-    # If the check is successful, we allow for the asset to be consumed
+    # if the check is successful, we allow for the asset to be consumed
     # ---------------------------------------------------------------------------------------------
 
-    # Add all assets from the note to the account
-    exec.wallet::add_assets_to_account
-    # => []
+    # add all assets from the note to the account
+    exec.wallet::move_note_assets_to_account
+    # => [pad(16)]
 end

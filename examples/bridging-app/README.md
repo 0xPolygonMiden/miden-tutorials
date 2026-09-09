@@ -15,24 +15,30 @@ yarn install
 yarn dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173). The app exposes two tabs — `Bridge to EVM` (Miden → Sepolia) and `Withdraw to Miden` (Sepolia → Miden) — wired to the Epoch testnet allocator (`testnet-dev.epochprotocol.xyz`).
+Open [http://localhost:5173](http://localhost:5173). The app exposes two tabs — `Bridge to EVM` (Miden → Sepolia) and `Withdraw to Miden` (Sepolia → Miden). It defaults to Miden **testnet**. A live round trip requires an Epoch allocator and asset faucet deployed on that same network, plus both wallets.
 
 ## Environment
 
 Copy `.env.example` to `.env` and supply the required values:
 
-| Variable                     | Required | Description                                                                 |
-| ---------------------------- | -------- | --------------------------------------------------------------------------- |
-| `VITE_RAINBOWKIT_PROJECT_ID` | yes      | WalletConnect Cloud project id from <https://cloud.walletconnect.com/>.     |
-| `VITE_ALLOCATOR_URL`         | yes      | Epoch allocator endpoint (default `https://testnet-dev.epochprotocol.xyz`). |
-| `VITE_MIDEN_RPC_URL`         | no       | Miden RPC; defaults to `testnet`.                                           |
-| `VITE_MIDEN_PROVER`          | no       | Miden prover; defaults to `testnet`.                                        |
-| `VITE_MIDENSCAN_URL`         | no       | Override block-explorer base; defaults to `https://testnet.midenscan.com`.  |
+| Variable                     | Required     | Description                                                                                                       |
+| ---------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `VITE_RAINBOWKIT_PROJECT_ID` | yes          | WalletConnect Cloud project id from <https://cloud.walletconnect.com/>.                                           |
+| `VITE_ALLOCATOR_URL`         | yes          | An Epoch allocator compatible with v0.16 on the selected Miden network.                                           |
+| `VITE_MIDEN_NETWORK`         | no           | `testnet` (default), `devnet`, or `local`; selects the wallet network and RPC/prover defaults.                    |
+| `VITE_MIDEN_RPC_URL`         | no           | Override Miden RPC; must match the selected wallet network.                                                       |
+| `VITE_MIDEN_PROVER`          | no           | Override the prover; `local` uses local proving.                                                                  |
+| `VITE_MIDEN_USDC_FAUCET_ID`  | yes for USDC | Allocator-approved faucet on the selected network. If unset, enter it manually in the form; no old ID is assumed. |
+| `VITE_MIDENSCAN_URL`         | no           | Override block-explorer base; defaults to the selected network's Midenscan.                                       |
+
+For explicit devnet checks, set `VITE_MIDEN_NETWORK`, `VITE_MIDEN_RPC_URL`, and
+`VITE_MIDEN_PROVER` to `devnet` and use a matching allocator and faucet.
 
 ## Prerequisites
 
 - An EVM wallet supported by [RainbowKit](https://www.rainbowkit.com/) (MetaMask, Rabby, Coinbase Wallet, …).
 - The [MidenFi browser extension](https://chromewebstore.google.com/detail/miden-wallet/ablmompanofnodfdkgchkpmphailefpb) to sign the P2IDE note on Miden.
+- Native MIDEN tokens in the Miden wallet to pay transaction fees.
 - A small Sepolia ETH balance for gas; grab some from the [pk910 PoW faucet](https://sepolia-faucet.pk910.de/) or the [Google Cloud Sepolia faucet](https://cloud.google.com/application/web3/faucet/ethereum/sepolia).
 
 ## Scripts
@@ -41,7 +47,7 @@ Copy `.env.example` to `.env` and supply the required values:
 yarn dev            # Vite dev server (http://localhost:5173)
 yarn build          # tsc -b && vite build
 yarn preview        # Serve the production build locally
-yarn test           # Vitest (scaffold-inherited tests)
+yarn test           # Vitest
 yarn lint           # ESLint
 ```
 

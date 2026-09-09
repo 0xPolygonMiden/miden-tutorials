@@ -5,13 +5,13 @@ sidebar_position: 9
 
 # Bridging Miden to and from EVM with Epoch
 
-_Move assets between Miden and Sepolia testnet through the Epoch protocol intent SDK, without writing a custom bridge_
+_Move assets between Miden testnet and Sepolia testnet through the Epoch protocol intent SDK, without writing a custom bridge_
 
 ## Overview
 
-This is a guided tour of the runnable reference app under [`examples/bridging-app/`](https://github.com/0xMiden/tutorials/tree/main/examples/bridging-app), which bridges fungible tokens between Miden and an EVM chain (Sepolia testnet) in both directions through the [Epoch protocol](https://epochprotocol.xyz/) intent SDK. Clone and run the app, then read the steps below as annotations on the integration points you'd port into your own Miden frontend. Every fenced code block is a verbatim slice of the app; the file and line range above each block points to the source.
+This is a guided tour of the reference app under [`examples/bridging-app/`](https://github.com/0xMiden/tutorials/tree/main/examples/bridging-app), which bridges fungible tokens between Miden testnet and Sepolia through the [Epoch protocol](https://epochprotocol.xyz/) intent SDK. Clone and run the app, then read the steps below as annotations on the integration points you'd port into your own Miden frontend. Every fenced code block is a verbatim slice of the app; the file and line range above each block points to the source.
 
-> **When to use Epoch vs Agglayer.** This tutorial uses **Epoch** because it is the only Miden bridge with a working TypeScript SDK, EVM-wallet integration, and broad chain coverage today — Epoch's Compact contract is deployed on Ethereum, Polygon, Optimism, Arbitrum, Base (mainnet) and on Sepolia plus six other EVM testnets. If your app is **authored in Rust/MASM, needs Polygon CDK ecosystem compatibility, or settles on a Polygon Agglayer-connected rollup**, the Agglayer protocol surface ships in-tree at [`protocol/crates/miden-agglayer/SPEC.md`](https://github.com/0xMiden/protocol/blob/next/crates/miden-agglayer/SPEC.md); Miden testnet ↔ Sepolia bridging via Agglayer went live on 2026-04-24.
+Live settlement requires an Epoch allocator and asset faucet deployed on the selected Miden network and compatible with v0.16. Devnet is available for explicit checks by setting `VITE_MIDEN_NETWORK`, `VITE_MIDEN_RPC_URL`, and `VITE_MIDEN_PROVER` to `devnet` with a matching allocator and faucet.
 
 Stack: Vite + React 19 + TypeScript, `@miden-sdk/react`, `@epoch-protocol/epoch-intents-sdk`, [RainbowKit](https://www.rainbowkit.com/) + [wagmi](https://wagmi.sh/) + [viem](https://viem.sh/).
 
@@ -20,14 +20,14 @@ Stack: Vite + React 19 + TypeScript, `@miden-sdk/react`, `@epoch-protocol/epoch-
 - Wire the Epoch SDK against a wagmi `walletClient`, including the chain-id override for Miden-source intents.
 - Build a Miden → EVM bridge: reverse-quote, sign a P2IDE note via the MidenFi wallet adapter, submit the intent, and poll for settlement.
 - Build the reverse EVM → Miden bridge: deposit an ERC-20 into Epoch's Compact contract and receive a P2ID note on Miden.
-- A `EpochIntentSDK` API reference card with all 11 public methods.
+- An `EpochIntentSDK` API reference card for quoting, settlement, and recovery.
 - Inline pitfalls — the eleven traps every Epoch integration hits before the first successful round-trip.
 
 ## Prerequisites
 
 You need three things to follow along.
 
-1. The reference app, cloned from this repo. The bridging-specific layer (Epoch SDK wiring, wagmi/RainbowKit + viem, intent forms, status panels) lives in `examples/bridging-app/`; `yarn create miden-app` (≥ 1.0.7) is the Miden + Vite + WASM scaffold it started from. Clone the repo, `cd examples/bridging-app`, then `cp .env.example .env` inside that directory and fill in: `VITE_RAINBOWKIT_PROJECT_ID` (a [WalletConnect Cloud](https://cloud.walletconnect.com/) project id — required), `VITE_ALLOCATOR_URL` (default `https://testnet-dev.epochprotocol.xyz`), `VITE_MIDEN_RPC_URL` (default `testnet`), `VITE_MIDEN_PROVER` (default `testnet`), and the optional `VITE_MIDENSCAN_URL`. See the [setup guide](./setup_guide.md) if this is your first Miden frontend.
+1. The reference app, cloned from this repo. The bridging-specific layer (Epoch SDK wiring, wagmi/RainbowKit + viem, intent forms, status panels) lives in `examples/bridging-app/`; `yarn create miden-app` (≥ 1.0.7) is the Miden + Vite + WASM scaffold it started from. Clone the repo, `cd examples/bridging-app`, then `cp .env.example .env` inside that directory and fill in: `VITE_RAINBOWKIT_PROJECT_ID` (a [WalletConnect Cloud](https://cloud.walletconnect.com/) project id — required), `VITE_ALLOCATOR_URL` (an Epoch allocator compatible with the pinned SDK), `VITE_MIDEN_NETWORK` (default `testnet`), optional `VITE_MIDEN_RPC_URL` and `VITE_MIDEN_PROVER` overrides, `VITE_MIDEN_USDC_FAUCET_ID` from the selected allocator deployment, and the optional `VITE_MIDENSCAN_URL`. The wallet network, RPC, faucet, and allocator must agree. Keep native MIDEN tokens in the wallet to pay both collateral and note-consumption fees. See the [setup guide](./setup_guide.md) if this is your first Miden frontend.
 
 2. Two wallets: an EVM wallet supported by [RainbowKit](https://www.rainbowkit.com/) (MetaMask, Rabby, Coinbase Wallet, …) and the [MidenFi browser extension](https://chromewebstore.google.com/detail/miden-wallet/ablmompanofnodfdkgchkpmphailefpb) for signing P2IDE notes on Miden.
 
@@ -90,7 +90,7 @@ The snippet below sits inside the `useEpochIntent` hook — `walletClient` is `u
 ```
 
 :::caution Do not follow the package README
-The npm package ships a `# Compact SDK` README that documents a different SDK and a different surface. Treat `EpochIntentSDK`'s exported method names from `dist/index.d.ts` as the source of truth — the [API Reference Card](#api-reference-card) below lists them.
+The npm package ships a `# Compact SDK` README that documents a different SDK and a different surface. Treat `EpochIntentSDK`'s exported method names from `dist/sdk/epoch-intent-sdk.d.ts` as the source of truth — the [API Reference Card](#api-reference-card) below lists them.
 :::
 
 The `useWithdrawIntent` hook keeps `walletClient.chain.id` untouched — the EVM → Miden direction uses the real Sepolia chain id (`11155111`).
@@ -99,9 +99,9 @@ The `useWithdrawIntent` hook keeps `walletClient.chain.id` untouched — the EVM
 
 A Miden → EVM bridge runs four stages: `getTaskData` (the allocator computes a quote envelope), `getIntentQuote` (price discovery), `solveIntent` (the user signs a P2IDE note on Miden via the wallet adapter callback), and a 5-second polling loop against `getIntentStatus` until the solver lands the EVM transfer. The reference app's `buildEpochTaskDataParams` produces the envelope and computes `midenReclaimHeight` at the call site so it stays relative to the current Miden chain tip (Pitfalls row 4 has the technical reason).
 
-**From `examples/bridging-app/src/services/epoch-bridge.ts` (lines 141–173):**
+**From `examples/bridging-app/src/services/epoch-bridge.ts` (lines 133–165):**
 
-<!-- source: examples/bridging-app/src/services/epoch-bridge.ts:141-173 -->
+<!-- source: examples/bridging-app/src/services/epoch-bridge.ts:133-165 -->
 
 ```typescript
   // Reclaim height must come from the call site as `currentMidenBlock + N`.
@@ -139,48 +139,51 @@ A Miden → EVM bridge runs four stages: `getTaskData` (the allocator computes a
   };
 ```
 
-Once the quote returns and the user clicks **Confirm & sign**, the `createMidenP2IDNote` callback fires. The reference app's callback uses `useMidenFiWallet().requestSend` to construct an explicitly `'public'` P2IDE `SendTransaction`, guards the amount under `Number.MAX_SAFE_INTEGER` (the wallet adapter's `SendTransaction` constructor takes a `number`, not a `bigint`), and awaits a 120-second `waitForTransaction(txId, 120_000)` to read the output note id.
+Once the quote returns and the user clicks **Confirm & sign**, `createMidenP2IDENote` receives the allocator, relative recall window, and mandate-binding attachment from Epoch. The app builds a public P2IDE note containing those exact values, prepares a fee-aware custom request, and asks the wallet to sign it with `requestTransaction`. Amounts remain `bigint`. After confirmation it locates the exact collateral note ID, excluding any `TX_FEE` output.
 
-**From `examples/bridging-app/src/components/crosschain/IntentForm.tsx` (lines 200–243):**
+**From `examples/bridging-app/src/components/crosschain/IntentForm.tsx` (lines 202–248):**
 
-<!-- source: examples/bridging-app/src/components/crosschain/IntentForm.tsx:200-243 -->
+<!-- source: examples/bridging-app/src/components/crosschain/IntentForm.tsx:202-248 -->
 
 ```typescript
-    const createMidenP2IDNote: SolveIntentParams['createMidenP2IDNote'] = async (
+    const createMidenP2IDENote: SolveIntentParams['createMidenP2IDENote'] = async (
       faucetIdParam,
       amountParam,
       allocatorId,
+      recallBlocks,
+      bindingAttachmentFelts,
     ) => {
       setConfirmStatus('Resource lock required — creating P2IDE note on Miden…');
       try {
         if (!midenAccountId) {
           throw new Error('Missing Miden account id');
         }
-        if (!requestSend) {
-          throw new Error('Miden wallet adapter is not connected');
+        if (!requestTransaction || !waitForTransaction || !client) {
+          throw new Error('Connect a Miden wallet that supports custom transactions and confirmation');
         }
 
-        const normalizedAmount = BigInt(amountParam);
-        if (normalizedAmount > BigInt(Number.MAX_SAFE_INTEGER)) {
-          throw new Error('Amount too large for wallet adapter send');
-        }
-
-        const payload = new SendTransaction(
-          midenAccountId,
-          allocatorId,
-          faucetIdParam,
-          'public',
-          Number(normalizedAmount),
+        const { request, expectedNoteId } = await runExclusive(async () => {
+          const head = await client.syncState();
+          const note = createEpochCollateralNote({
+            sender: midenAccountId, allocator: allocatorId, faucet: faucetIdParam,
+            amount: BigInt(amountParam), currentBlock: head.blockNum(),
+            recallBlocks, bindingAttachmentFelts,
+          });
+          const builder = await client.feeAwareTransactionRequestBuilder(AccountId.fromHex(midenAccountId));
+          return {
+            expectedNoteId: note.id().toString(),
+            request: builder.withOwnOutputNotes(new NoteArray([note])).build(),
+          };
+        });
+        const txId = await requestTransaction(
+          Transaction.createCustomTransaction(midenAccountId, allocatorId, request),
         );
-        const txId = await requestSend(payload);
 
-        // Prefer adapter waitForTransaction to get the output note id.
-        if (!waitForTransaction) {
-          throw new Error('Miden wallet adapter is missing waitForTransaction');
-        }
+        // Wait for the wallet to confirm the collateral before submitting it to Epoch.
         const finalized = await waitForTransaction(txId, 120_000);
-        const first = finalized.outputNotes?.[0];
-        const noteId = first ? first.id().toString() : '';
+        // A fee-paying transaction also creates a TX_FEE note. Match our exact
+        // collateral note instead of assuming outputNotes[0] is the payment.
+        const noteId = finalized.outputNotes?.find(note => note.id().toString() === expectedNoteId)?.id().toString();
         if (!noteId) {
           throw new Error(`Could not read output note id for tx ${txId}`);
         }
@@ -192,7 +195,7 @@ Once the quote returns and the user clicks **Confirm & sign**, the `createMidenP
     };
 ```
 
-Success is signalled by the 5-second polling loop: `getIntentStatus` returns an `IntentTransactionStatus[]`, which the app reduces into the composite `IntentFlowStatus`. The forward bridge is settled once the destination chain reports a terminal-OK row (`evmCompleted`) and the synthetic Miden row carries a terminal `midenStatus` — the EVM transfer landed and the allocator consumed the P2IDE note. That reducer is destination-chain aware: it filters status rows to the chain the user selected, never reports completion while any destination-chain row is still `pending`, and takes the last destination-chain success — so an intermediate allocator/Compact row is never mistaken for the final settlement. The Pitfalls section below catalogues the gotchas this step inherits (public note type, awaiting `waitForTransaction`, advisory `midenFaucetDecimals`, the `Number.MAX_SAFE_INTEGER` guard).
+Success is signalled by the 5-second polling loop: `getIntentStatus` returns an `IntentTransactionStatus[]`, which the app reduces into the composite `IntentFlowStatus`. The forward bridge is settled once the destination chain reports a terminal-OK row (`evmCompleted`) and the synthetic Miden row carries a terminal `midenStatus` — the EVM transfer landed and the allocator consumed the P2IDE note. That reducer is destination-chain aware: it filters status rows to the chain the user selected, never reports completion while any destination-chain row is still `pending`, and takes the last destination-chain success — so an intermediate allocator/Compact row is never mistaken for the final settlement. The Pitfalls section below catalogues the gotchas this step inherits (public note type, awaiting `waitForTransaction`, advisory `midenFaucetDecimals`, the exact collateral-note ID check).
 
 ## Step 3: EVM → Miden bridge
 
@@ -202,9 +205,9 @@ The reverse direction lives in `buildEVMToMidenTaskDataParams` + `useWithdrawInt
 The Step 3 reverse quote folds a route fee into the required deposit, so a Step 2 bridge of exactly 1 USDC won't cover a 1-USDC reverse — the quote asks for ~1.01 USDC and MetaMask flags `depositERC20AndRegister` as likely to fail (the `approve` lands first; rejecting the deposit is recoverable). Set Step 2's `min output` to about `2e18` for headroom, or run a second forward bridge before retrying.
 :::
 
-**From `examples/bridging-app/src/services/epoch-bridge.ts` (lines 224–245):**
+**From `examples/bridging-app/src/services/epoch-bridge.ts` (lines 216–237):**
 
-<!-- source: examples/bridging-app/src/services/epoch-bridge.ts:224-245 -->
+<!-- source: examples/bridging-app/src/services/epoch-bridge.ts:216-237 -->
 
 ```typescript
   const taskDataParams = {
@@ -234,7 +237,7 @@ The Step 3 reverse quote folds a route fee into the required deposit, so a Step 
 `solveIntent({ ..., collateralType: CollateralType.EVM })` then walks the user's wallet through an ERC-20 `approve` (only on the first deposit of a given token) and `depositERC20AndRegister` / `depositNativeAndRegister` against Epoch's [Compact](https://docs.epochprotocol.xyz/epoch-miden-integration/integration-guide) contract on Sepolia. The intent nonce extracted from the solve result drives the same 5-second status poll as the forward direction.
 
 :::caution Forced-withdrawal preflight
-If the user cancelled a prior EVM → Miden intent on the same Compact deposit id, the next intent will revert. Call `sdk.disableForcedWithdrawal({ ... })` first; the SDK error message names the deposit id when this preflight is required.
+If the user cancelled a prior EVM → Miden intent on the same Compact deposit id, the next intent will revert. Call `sdk.disableForcedWithdrawal(depositId)` first; the SDK error message names the deposit id when this preflight is required.
 :::
 
 :::caution The Withdraw token is Epoch's test ERC-20, not Circle's USDC
@@ -243,41 +246,41 @@ The "USDC" the Withdraw form lists is Epoch's test token (`0x2BB4FfD7…`), not 
 
 ## Step 4: The bridged P2ID note is consumed by your wallet
 
-Step 3's allocator delivers its output as a **P2ID note** addressed to your Miden account, not as a vault credit. In Miden's actor model, a note must be _consumed_ in a transaction before it becomes spendable balance. The Miden Wallet consumes incoming P2ID notes when it detects them, so the bridged funds appear as wallet balance within seconds and are immediately usable as the source for another Miden → EVM bridge. The reference app's `WithdrawConsume` component keeps this step informational: it shows the delivered note ID and links to Midenscan so you can confirm settlement.
+Step 3's allocator delivers its output as a **P2ID note** addressed to your Miden account, not as a vault credit. The note must be consumed in a transaction before it becomes spendable. Wallet auto-consumption depends on the installed wallet's configuration and sufficient native MIDEN for fees: a USDC-only note cannot pay that native fee. The reference app links the delivered note to Midenscan; confirm its consumption and the final wallet balance before treating the bridge as complete.
 
 ## API Reference Card
 
-Most apps only touch four methods (`getTaskData`, `getIntentQuote`, `solveIntent`, `getIntentStatus`); the rest cover recovery and read-only queries. Sources cite `dist/index.d.ts` from `@epoch-protocol/epoch-intents-sdk@1.0.23`.
+Most apps only touch four methods. The selected signatures below come from `dist/sdk/epoch-intent-sdk.d.ts` in the pinned `@epoch-protocol/epoch-intents-sdk@1.0.38`.
 
-| Method                      | Signature (abridged)                                                     | Use it to                                                              | Source               |
-| --------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------- | -------------------- |
-| `getTaskData`               | `(params: GetTaskDataParams) => Promise<{ taskTypeString, intentData }>` | Construct the SIO envelope before quoting                              | `dist/index.d.ts:11` |
-| `solveIntent`               | `(params: SolveIntentParams) => Promise<SolveIntentResult>`              | Submit the intent + run the optional Miden P2ID note callback          | `dist/index.d.ts:12` |
-| `getIntentQuote`            | `(params: GetIntentQuoteParams) => Promise<IntentQuoteResult>`           | Reverse-quote (`tokenInAmount: '0'`) or forward quote                  | `dist/index.d.ts:13` |
-| `retryIntentSolve`          | `(id: string) => Promise<TransactionResult>`                             | Re-run the solver if a transient failure is observed                   | `dist/index.d.ts:14` |
-| `initateDepositWithdrawal`  | `(id: string) => Promise<TransactionResult>`                             | Initiate a forced withdrawal flow (verbatim misspelling; see Pitfalls) | `dist/index.d.ts:16` |
-| `disableForcedWithdrawal`   | `(params: DisableForcedWithdrawalParams) => Promise<TransactionResult>`  | Cancel a pending forced withdrawal so a new intent can solve           | `dist/index.d.ts:17` |
-| `withdrawToken`             | `(params: WithdrawTokenParams) => Promise<TransactionResult>`            | Reclaim an unfulfilled EVM-side deposit                                | `dist/index.d.ts:18` |
-| `getForcedWithdrawalStatus` | `(id: string) => Promise<ForcedWithdrawalStatus>`                        | Observe a forced-withdrawal lifecycle                                  | `dist/index.d.ts:19` |
-| `getDepositedBalances`      | `(addr: string) => Promise<DepositedBalance[]>`                          | List the user's locked balances in the Compact                         | `dist/index.d.ts:20` |
-| `getIntentStatus`           | `(addr: string, nonce: string) => Promise<IntentTransactionStatus[]>`    | Drive the 5s polling loop                                              | `dist/index.d.ts:21` |
-| `getHealthCheck`            | `() => Promise<HealthCheckResult>`                                       | Probe allocator availability before quoting                            | `dist/index.d.ts:22` |
+| Method                      | Signature (abridged)                                          | Purpose                      |
+| --------------------------- | ------------------------------------------------------------- | ---------------------------- |
+| `getTaskData`               | `(params: GetTaskDataParams)`                                 | Build the quote envelope     |
+| `getIntentQuote`            | `({ sponsorAddress, taskTypeString, intentData, isNative? })` | Obtain a quote               |
+| `solveIntent`               | `(params: SolveIntentParams)`                                 | Sign and submit the intent   |
+| `getIntentStatus`           | `(userAddress: string, nonce: string)`                        | Poll settlement              |
+| `retryIntentSolve`          | `(request: CompactRequest)`                                   | Retry a recorded allocation  |
+| `initateDepositWithdrawal`  | `(id: string)`                                                | Initiate forced withdrawal   |
+| `disableForcedWithdrawal`   | `(id: string)`                                                | Cancel forced withdrawal     |
+| `withdrawToken`             | `(id: string, recipient: string, amount: string)`             | Withdraw a deposit           |
+| `getForcedWithdrawalStatus` | `(account: string, id: string)`                               | Inspect recovery status      |
+| `getDepositedBalances`      | `(account: string, tokens: CompactTokenBalanceInput[])`       | Inspect locked balances      |
+| `getHealthCheck`            | `()`                                                          | Probe allocator availability |
 
 Recovery primitives (`retryIntentSolve`, `disableForcedWithdrawal`, `withdrawToken`, `initateDepositWithdrawal`) are the difference between an intent flow that "mostly works" and one that lets users recover from solver outages or network failures.
 
 ## Pitfalls
 
-Eleven traps every Epoch integration hits before the first successful round-trip. The reference app ships mitigations for each.
+Check these integration details before a live round trip:
 
-- **Don't follow the npm package README.** It documents an unrelated SDK; the [integration guide](https://docs.epochprotocol.xyz/epoch-miden-integration/integration-guide) and `dist/index.d.ts` are the source of truth.
+- **Don't follow the npm package README.** It documents an unrelated SDK; the [integration guide](https://docs.epochprotocol.xyz/epoch-miden-integration/integration-guide) and `dist/sdk/epoch-intent-sdk.d.ts` are the source of truth.
 - **Public notes only.** P2IDE notes for the allocator must be `'public'`; a `'private'` note is invisible to the solver.
-- **Always await `waitForTransaction`.** Reading `outputNotes[0]` early returns an empty array; the 120-second timeout covers proving + testnet submission.
-- **Reclaim height is `currentBlock + N`.** `midenReclaimHeight` is absolute; use `useSyncState().syncHeight + 1000` at the call site, never a literal.
+- **Await confirmation and match the note ID.** A fee-paying transaction also creates a `TX_FEE` output. Do not pass `outputNotes[0]` to Epoch; locate the exact collateral note ID after `waitForTransaction`.
+- **Honor Epoch’s callback window and binding.** `createMidenP2IDENote` supplies `recallBlocks` and `bindingAttachmentFelts`. Build a public P2IDE with `currentBlock + recallBlocks` after a fresh sync and include the attachment verbatim. A plain `SendTransaction` cannot represent this attachment. The quote’s preliminary reclaim-height field is not a substitute for the callback values.
 - **`minTokenOut` is base units.** The reverse-quote path passes it straight through — no `parseUnits`. For an 18-decimal token, `"1000000000000000000"` is one whole unit.
 - **Override `walletClient.chain.id` for Miden-source intents.** Set `chain.id = 999999999` for Miden → EVM only; leave it as the real EVM chain id for the reverse direction.
 - **`midenFaucetDecimals` is advisory.** Fall back to UI-selected decimals when the allocator value would change the displayed amount by an order of magnitude.
-- **`Number.MAX_SAFE_INTEGER` guard.** The wallet adapter's `SendTransaction` constructor takes a `number`; guard the amount before casting.
-- **No COOP/COEP on the dev server.** `midenVitePlugin({ crossOriginIsolation: false })` is mandatory — the default breaks gRPC-Web to `transport.miden.io`.
+- **Keep collateral amounts as `bigint`.** The custom request uses `FungibleAsset` directly, avoiding a lossy `number` conversion.
+- **Check browser cross-origin compatibility.** This single-threaded app uses `midenVitePlugin({ crossOriginIsolation: false })`; verify the chosen RPC and wallet support before enabling cross-origin isolation.
 - **Forced-withdrawal preflight.** Call `sdk.disableForcedWithdrawal` before re-running an EVM → Miden intent on a deposit id the user cancelled previously.
 - **`initateDepositWithdrawal` (misspelling).** The SDK exports the method with the typo — use it verbatim, do not silently rename.
 

@@ -1,27 +1,31 @@
-use rand::RngCore;
+use rand::Rng;
+use rust_client::TutorialClientExt;
 use std::{path::PathBuf, sync::Arc};
 
 use miden_client::{
     account::{
-        component::AccountComponentMetadata, AccountBuilder, AccountComponent,
-        AccountType, StorageSlot, StorageSlotName,
+        component::{AccountComponentMetadata, BasicWallet},
+        AccountBuilder, AccountComponent, AccountType, StorageSlot, StorageSlotName,
     },
-    address::NetworkId,
     auth::NoAuth,
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient},
+    rpc::{GrpcClient, VerifyingRpcClient},
     transaction::TransactionRequestBuilder,
     ClientError, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use rust_client::{fund_account_for_fees, FeeConfig, TutorialNetwork};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     // Initialize client
-    let endpoint = Endpoint::testnet();
+    let network = TutorialNetwork::from_env()?;
+    let endpoint = network.endpoint();
     let timeout_ms = 10_000;
-    let rpc_client = Arc::new(GrpcClient::new(&endpoint, timeout_ms));
+    let rpc_client = Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+        &endpoint, timeout_ms,
+    )));
 
     // Initialize keystore
     let keystore_path = PathBuf::from("./keystore");
@@ -33,12 +37,12 @@ async fn main() -> Result<(), ClientError> {
         .rpc(rpc_client)
         .sqlite_store(store_path)
         .authenticator(keystore.clone())
-        .in_debug_mode(true.into())
         .build()
         .await?;
 
     let sync_summary = client.sync_state().await.unwrap();
     println!("Latest block: {}", sync_summary.block_num);
+    let fee_config = FeeConfig::from_client(&client, network).await?;
 
     // -------------------------------------------------------------------------
     // STEP 1: Create a basic counter contract
@@ -75,7 +79,8 @@ async fn main() -> Result<(), ClientError> {
     let counter_contract = AccountBuilder::new(seed)
         .account_type(AccountType::Public)
         .with_component(counter_component.clone())
-        .with_auth_component(NoAuth)
+        .with_component(BasicWallet)
+        .with_component(NoAuth)
         .build()
         .unwrap();
 
@@ -87,6 +92,7 @@ async fn main() -> Result<(), ClientError> {
     println!("counter_contract storage: {:?}", counter_contract.storage());
 
     client.add_account(&counter_contract, false).await.unwrap();
+    fund_account_for_fees(&mut client, counter_contract.id(), &fee_config).await?;
 
     // -------------------------------------------------------------------------
     // STEP 2: Call the Counter Contract with a script
@@ -113,18 +119,19 @@ async fn main() -> Result<(), ClientError> {
 
     // Execute and submit the transaction
     let tx_id = client
-        .submit_new_transaction(counter_contract.id(), tx_increment_request)
+        .submit_tutorial_transaction(counter_contract.id(), tx_increment_request)
         .await
         .unwrap();
 
     println!(
-        "View transaction on MidenScan: https://testnet.midenscan.com/tx/{:?}",
+        "View transaction on MidenScan: {}/tx/{:?}",
+        network.explorer_url(),
         tx_id
     );
 
     println!(
         "Counter contract id: {:?}",
-        counter_contract.id().to_bech32(NetworkId::Testnet)
+        counter_contract.id().to_bech32(network.network_id())
     );
 
     client.sync_state().await.unwrap();
@@ -138,6 +145,11 @@ async fn main() -> Result<(), ClientError> {
     println!(
         "counter contract storage: {:?}",
         account.storage().get_item(&counter_slot_name)
+    );
+    assert_eq!(
+        account.storage().get_item(&counter_slot_name).unwrap()[0].as_canonical_u64(),
+        1,
+        "the deployed counter must increment from zero to one",
     );
 
     Ok(())

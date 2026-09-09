@@ -12,6 +12,9 @@ WEB_EXAMPLES=(
   incrementCounterContract
   unauthenticatedNoteTransfer
   foreignProcedureInvocation
+  react:createMintConsume
+  react:multiSendWithDelegatedProver
+  react:unauthenticatedNoteTransfer
 )
 
 WEB_SKIPPED=()
@@ -31,11 +34,7 @@ RUST_EXAMPLES=(
   unauthenticated_note_transfer
 )
 
-RUST_SKIPPED=(
-  counter_contract_fpi
-  counter_contract_increment
-  oracle_data_query
-)
+RUST_SKIPPED=(oracle_data_query)
 
 usage() {
   cat <<'EOF'
@@ -49,6 +48,10 @@ Examples:
   yarn tutorials --rust
   yarn tutorials --web=createMintConsume
   yarn tutorials --rust=counter_contract_deploy
+
+The default network is testnet. Set TUTORIAL_NETWORK=devnet for devnet tests.
+Counter FPI/increment use a counter deployed by this run unless
+MIDEN_COUNTER_ACCOUNT_ID is set.
 EOF
 }
 
@@ -92,6 +95,12 @@ saw_selector=0
 web_names=()
 rust_names=()
 failures=()
+tutorial_network="${TUTORIAL_NETWORK:-testnet}"
+
+if [[ "$tutorial_network" != "testnet" && "$tutorial_network" != "devnet" ]]; then
+  echo "TUTORIAL_NETWORK must be either testnet or devnet, got: $tutorial_network" >&2
+  exit 1
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -187,8 +196,11 @@ if [[ "$run_web" -eq 1 ]]; then
   done
 
   web_pattern="$(IFS='|'; echo "${web_names[*]}")"
-  echo "Running web tutorials: ${web_names[*]}"
-  if ! yarn --cwd "$WEB_DIR" playwright test --grep "$web_pattern"; then
+  echo "Running web tutorials on $tutorial_network: ${web_names[*]}"
+  if ! NEXT_PUBLIC_MIDEN_NETWORK="$tutorial_network" \
+    NEXT_PUBLIC_MIDEN_FAUCET_URL="${MIDEN_FAUCET_URL:-}" \
+    NEXT_PUBLIC_MIDEN_FEE_AMOUNT="${MIDEN_FEE_AMOUNT:-}" \
+    yarn --cwd "$WEB_DIR" playwright test --grep "(^| )($web_pattern)$"; then
     failures+=("web")
   fi
 fi
@@ -214,7 +226,18 @@ if [[ "$run_rust" -eq 1 ]]; then
     fi
   done
 
-  echo "Cleaning rust build artifacts before running tutorials..."
+  # Dependent tutorials must never reuse an account from an older network genesis.
+  if contains counter_contract_fpi "${rust_names[@]}" || contains counter_contract_increment "${rust_names[@]}"; then
+    if [[ -z "${MIDEN_COUNTER_ACCOUNT_ID:-}" ]]; then
+      ordered_names=(counter_contract_deploy)
+      for name in "${rust_names[@]}"; do
+        [[ "$name" == counter_contract_deploy ]] || ordered_names+=("$name")
+      done
+      rust_names=("${ordered_names[@]}")
+    fi
+  fi
+
+  echo "Cleaning rust build artifacts before running tutorials on $tutorial_network..."
   cargo clean --manifest-path "$RUST_DIR/Cargo.toml"
 
   mkdir -p "$RUNS_DIR"
@@ -239,13 +262,18 @@ if [[ "$run_rust" -eq 1 ]]; then
       set +e
       (
         cd "$run_dir"
-        RUST_BACKTRACE=1 cargo run --manifest-path "$RUST_DIR/Cargo.toml" --bin "$name"
+        MIDEN_NETWORK="$tutorial_network" RUST_BACKTRACE=1 \
+          cargo run --locked --manifest-path "$RUST_DIR/Cargo.toml" --bin "$name"
       ) 2>&1 | tee "$run_dir/output.log"
       status=${PIPESTATUS[0]}
       set -e
       echo "Output log: $run_dir/output.log"
 
       if [[ "$status" -eq 0 ]]; then
+        if [[ "$name" == counter_contract_deploy ]]; then
+          MIDEN_COUNTER_ACCOUNT_ID="$(sed -n 's/^Counter contract id: "\([^"]*\)"$/\1/p' "$run_dir/output.log" | tail -n 1)"
+          export MIDEN_COUNTER_ACCOUNT_ID
+        fi
         break
       fi
 

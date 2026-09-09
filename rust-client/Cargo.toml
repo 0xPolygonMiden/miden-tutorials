@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-miden-client = { version = "0.15", features = ["testing", "tonic"] }
-miden-client-sqlite-store = { version = "0.15", package = "miden-client-sqlite-store" }
-miden-protocol = { version = "0.15" }
-rand = { version = "0.9" }
+hex = "0.4"
+miden-client = { version = "=0.16.0", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { version = "=0.16.0", package = "miden-client-sqlite-store" }
+miden-protocol = { version = "=0.16.0" }
+rand = { version = "0.10" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tokio = { version = "1.48", features = ["rt-multi-thread", "net", "macros", "fs"] }
+
+# Local proving in an unoptimized build can outlive the network's historical-state window.
+[profile.dev]
+opt-level = 2

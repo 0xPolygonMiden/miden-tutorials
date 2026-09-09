@@ -5,17 +5,27 @@ sidebar_position: 2
 
 # Miden Node Setup Tutorial
 
-To run the Miden tutorial examples, you connect to a Miden node. By default, **every tutorial in this book targets the public Miden testnet** — no local setup is required. If you would rather run against your own node, you can start a local network instead.
+The v0.16 client tutorials connect to public Miden testnet by default, so no local
+node is required. You can also configure them to use your own network.
 
-## Connecting to the Miden testnet
+## Connecting to the public networks
 
-The tutorials use the public testnet by default. Its RPC endpoint is:
+The testnet RPC endpoint is:
 
-```bash
-https://rpc.testnet.miden.io:443
+```text
+https://rpc.testnet.miden.io
 ```
 
-This is the endpoint the examples pass to the client (`Endpoint::testnet()` in the Rust client), so they work out of the box with no additional setup.
+Use `Endpoint::testnet()` in Rust or `MidenClient.createTestnet()` in the web SDK.
+The tutorial runner selects testnet by default:
+
+```bash
+yarn tutorials
+```
+
+Testnet transactions pay fees in the native asset. The examples fund new accounts
+from the public faucet before their first transaction. Use fresh local stores and
+reassemble MASM sources when migrating from an earlier release.
 
 ## Running a local network
 
@@ -25,4 +35,6 @@ Running against a local network is optional and only needed for a fully self-hos
 
 Network transactions additionally require the **network transaction builder** (`miden-ntx-builder`), the component that executes network notes on an account's behalf. The local-network setup linked above provisions it; a node without the builder will commit network notes but never execute them.
 
-Once your local network is running, point the tutorials at its RPC endpoint instead of `Endpoint::testnet()`.
+To use a local network, update the client's RPC endpoint and its address, native
+asset, and faucet configuration to match that deployment. The runner's
+`TUTORIAL_NETWORK` option accepts only `testnet` and `devnet`, not a local RPC URL.
